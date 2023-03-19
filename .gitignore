@@ -1,0 +1,5 @@
+key_openai.txt
+key_pinecone.txt
+/nexus/
+/gpt3_logs/
+/.idea/

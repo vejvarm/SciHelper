@@ -1,0 +1,9 @@
+PREVIOUS CONVERSATION:
+<<CONVERSATION>>
+
+I will now ask questions about the article above.
+USER: <<MESSAGE>>
+
+
+Let's take this step by step. You will now provide a long, detailed response with relevant references and citations:
+SciHelper:
