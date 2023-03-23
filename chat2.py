@@ -2,19 +2,22 @@
 # TODO: Weighting of different memories (how?)
 # TODO: considering negative prompts. Is that possible?
 
+# TODO: split papers into multiple smaller chunks (vectorize those and save into files for retrieval)
+# TODO: use local Alpaca instead of ChatGPT (https://github.com/tloen/alpaca-lora)
 import logging
 import os
+import uuid
+
 import openai
 import json
 import re
 import datetime
 import pinecone
 from pathlib import Path
-from arxiv import arxiv
-from time import time,sleep
+from time import time, sleep
 from uuid import uuid4
-from utils import parse_pdf
-from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS
+from utils import parse_pdf, fetch_and_download_from_arxiv, parse_latex_file_and_split, _extract_arxiv_id
+from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -98,17 +101,6 @@ def load_articles(results):
         top_k_list.append(aid)
     return top_k_list
 
-def fetch_arxiv_paper(paper_id: str):
-    response = arxiv.Search(id_list=[paper_id],
-                            max_results=1,
-                            sort_by=arxiv.SortCriterion.LastUpdatedDate,
-                            sort_order=arxiv.SortOrder.Descending)
-    if len(response.id_list) >= 1:
-        return next(response.results())
-    else:
-        LOGGER.warning("There is no article with that id!")
-        return None
-
 
 def initialize_conversation(vdb, init_json_path="nexus/user-init.json"):
     assert init_json_path.endswith(".json")
@@ -143,39 +135,23 @@ def initialize_conversation(vdb, init_json_path="nexus/user-init.json"):
     return output, vector, metadata
 
 
-def initialize_article(vdb, article_id):
-    article_folder = Path("articles/")
+def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR):
     vector = None
     if article_folder.joinpath(f"{article_id}/metadata.json").exists():
         metadata = json.load(article_folder.joinpath(f"{article_id}/metadata.json").open("r"))
-        vector = vdb.fetch([article_id], namespace=NS.ARTICLES.value)
+        vector = vdb.fetch([metadata["vector_ids"]], namespace=NS.ARTICLES.value)  # TODO fetch all vectors for given article
         # TODO: load vectors connected to the article from vdb
     else:
-        paper = fetch_arxiv_paper(article_id)
-        metadata = {"id": article_id,
-                    "title": paper.title,
-                    "authors": [a.name for a in paper.authors],
-                    "categories": paper.categories,
-                    "published": paper.published.strftime("%Y-%M-%d"),
-                    "journal_ref": paper.journal_ref,
-                    "links": [l.href for l in paper.links],
-                    "url": paper.pdf_url,
-                    "summary": paper.summary}
-        specific_folder = article_folder.joinpath(article_id)
-        specific_folder.mkdir(exist_ok=True)
-        json.dump(metadata, specific_folder.joinpath("metadata.json").open("w"), indent=4)
-        LOGGER.info(f"Downloading pdf from ArXiv for article with id: {article_id}.\nThis may take a while ...")
-        paper.download_pdf(dirpath=str(specific_folder), filename="paper.pdf")
-        LOGGER.info("... download complete")
-
-    # TODO: parse from arxiv source files instead? Maybe into HTML with arxiv-vanity
+        fetch_and_download_from_arxiv(article_id, article_folder)
+    # WIP: parse from arxiv source files instead
     text, _ = parse_pdf(article_folder.joinpath(metadata["id"]).joinpath("paper.pdf"))
-
+    sections = parse_latex_file_and_split(article_folder.joinpath(metadata["id"]).joinpath("tex").joinpath("main.tex"))
     # save article as vector into Pinecone
-    # TODO: this might be a lot of information for one vector, we should split it
+    # WIP: this might be a lot of information for one vector, we should split it
     if vector is None:
         vector = gpt3_embedding(text)
-        vdb.upsert([(article_id, vector)], namespace=NS.ARTICLES.value)
+        # TODO: as we have multiple vectors for one article, query by filtering article_id in metadata
+        vdb.upsert([(uuid4(), vector, {"article": article_id})], namespace=NS.ARTICLES.value)
 
     # TODO: continue here,
     #   we will need to send "prompt" through GPT and save the output
@@ -215,7 +191,7 @@ def prompt_for_article():
     while True:
         usr_input = input("Please give me a valid ArXiv article address or ID: ")
 
-        article_id = _extract_arxiv_id(usr_input)
+        article_id = _extract_arxiv_id(usr_input)  # TODO async: start downloading immediately
 
         if article_id:
             print("Thank you!")
@@ -223,16 +199,6 @@ def prompt_for_article():
         else:
             print("I couldn't find any article id in your input. Can you recheck and try again?\n")
             # TODO: "Would you like to continue without a specific article?"
-
-
-def _extract_arxiv_id(string):
-    pattern = r"(?:(?:arXiv:)?([0-9]{2}[0-1][0-9]\.[0-9]{4,5}(?:v[0-9]+)?|(?:[a-z|\-]+(\.[A-Z]{2})?\/\d{2}[0-1][0-9]\d{3})))"
-    # TODO: maybe ignore versions
-    match = re.search(pattern, string.strip())
-    if match:
-        return match.group(1)
-    else:
-        return None
 
 
 if __name__ == '__main__':
