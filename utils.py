@@ -10,7 +10,7 @@ from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexMacro
 from pylatexenc.latex2text import LatexNodes2Text
 from pathlib import Path
 from flags import ROOT_DIR, ARTICLE_DIR
-from typing import Sequence
+from typing import Sequence, Union, Callable
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.WARNING)
@@ -32,41 +32,6 @@ def make_article_metadata(id: str, title="", authors: Sequence[str] = tuple("", 
             "vector_ids": tuple(vector_ids),  # Will be filled later when article is actually initialized and parsed
             "summary": str(summary).strip()}
 
-
-def parse_pdf(source: Path or str):
-    """Load pdf from local or remote source and parse it into plain text."""
-    s = Path(source)
-
-    if s.exists():
-        pdf_file = s
-    else:
-        pdf_file = Path("temp.pdf")
-        try:
-            # Download the PDF from the URLarticle_folder.joinpath(f"{article_id}/metadata.json")
-            response = requests.get(url=source)
-            with pdf_file.open("wb") as f:
-                f.write(response.content)
-        except requests.RequestException as ex:
-            print(ex)
-            return None, None
-
-    # Open the PDF and parse the text
-    with open(pdf_file, "rb") as f:
-        LOGGER.info("Extracting text from PDF file (may take a while)...")
-        pdf = PyPDF2.PdfReader(f)
-        metadata = pdf.metadata
-        text = ""
-        for page_num in range(len(pdf.pages)):
-            page = pdf.pages[page_num]
-            text += page.extract_text()
-
-    # Clean up the temporary file
-    try:
-        os.remove("temp.pdf")
-    except FileNotFoundError:
-        LOGGER.info("temp.pdf didn't exist. Cleanup not necessary.")
-
-    return text, metadata
 
 def extract_tgz(source_archive: str or Path, extraction_folder: str or Path):
     """Extract """
@@ -107,7 +72,7 @@ def _fetch_arxiv_article(article_id: str):
         return None
 
 
-def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sourcefiles_subfolder="tex"):
+def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sourcefiles_subfolder="tex") -> Path or None:
     article_id = _extract_arxiv_id(article)
     paper = _fetch_arxiv_article(article_id)
     metadata = make_article_metadata(id=article_id,
@@ -129,8 +94,21 @@ def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sou
     extract_tgz(specific_folder.joinpath("paper.tgz"), specific_folder.joinpath(sourcefiles_subfolder))
     LOGGER.info("... download complete")
 
+    main_tex_file_path = specific_folder.joinpath(sourcefiles_subfolder).joinpath('main.tex')
+    pdf_file_path = specific_folder.joinpath("paper.pdf")
 
-def resolve_auxilary_tex_files(source_text: str, source_folder: Path) -> str:
+    if main_tex_file_path.exists():
+        LOGGER.debug("returning path to 'main.tex'")
+        return main_tex_file_path
+    elif pdf_file_path.exists():
+        LOGGER.debug("returning path to 'paper.pdf'")
+        return pdf_file_path
+    else:
+        LOGGER.warning("No acceptable files (pdf or tex) for parsing were fetched.")
+        return None
+
+
+def _resolve_auxilary_tex_files(source_text: str, source_folder: Path) -> str:
     """ Search through given text and find all instances of '\input{NAME}'.
     For each instance of '\input{NAME}' found, look for file called 'NAME.tex' and replace the '\input{NAME}' entry
     with the contents of the 'NAME.tex' file.
@@ -162,121 +140,145 @@ def resolve_auxilary_tex_files(source_text: str, source_folder: Path) -> str:
     return source_text
 
 
-def parse_latex_file_and_split(source_tex_file: Path or str):
+def choose_source_file_parser(source_file: Union[Path, str]) -> Callable:
+    """Validate if arXiv source file type is compatible with article parser and return appropriate parser function.
+
+    The supported file types from arXiv are .tex and .pdf.
+    - if .tex, return parse_latex_file_and_split()
+    - if .pdf, return parse_pdf_file_and_split()
+
+    :param source_file: path to arXiv source file (main.tex or {article_id}.pdf)
+    :return: function to parse source file
+    :raises ValueError: if file extension is not .tex or .pdf
+    """
+    source_file = Path(source_file)
+    if source_file.suffix == ".tex":
+        return parse_latex_file_and_split
+    elif source_file.suffix == ".pdf":
+        return parse_pdf_file_and_split
+    else:
+        raise ValueError("Unsupported file type. Only .tex and .pdf files are supported.")
+
+
+def _read_text_from_file(source_tex_file: Path or str) -> str:
+    source_file = Path(source_tex_file)
+    try:
+        with source_file.open() as f:
+            return f.read()
+    except FileNotFoundError:
+        LOGGER.warning(f"Specified file at path {source_file} doesn't exist. Returning empty string.")
+        return ''
+
+
+def parse_latex_file_and_split(source_tex_file: Path or str) -> dict[str: str]:
     """ Function that parses a provided latex document file and splits it by \section{...} nodes of the document
     :param tex: path to main LaTeX file of the article. Usually should be called main.tex
-    :return sections (list[tuple(section name, section content), ...]): list of section names and contents parsed in plain text (unicode)
+    :return sections (dict[section name: section content]): section names and contents parsed in plain text (unicode)
     """
     # DONE (critical): add support for parsing `\input{1_intro}` files into `main.tex`
     # TODO (normal): add support for citations (currently the parsed content has `<cit.>` everywhere)
     source_file = Path(source_tex_file)
-    try:
-        if not source_file.name.endswith('.tex'):
-            raise NameError(f"Specified file at path {source_file} doesn't end with .tex. Returning empty list.")
-        with source_file.open() as f:
-            text = f.read()
-    except FileNotFoundError:
-        LOGGER.warning(f"Specified file at path {source_file} doesn't exist. Returning empty list.")
-        return []
-    except NameError as err:
-        LOGGER.warning(err)
-        return []
+    text = _read_text_from_file(source_file)
 
     # parse auxilary .tex files which are referenced by /input{} in source_tex_file
-    text = resolve_auxilary_tex_files(text, source_file.parent)
-
+    text = _resolve_auxilary_tex_files(text, source_file.parent)
     LOGGER.debug(text)
 
     walker = LatexWalker(text)
-    latex2text = LatexNodes2Text(math_mode='verbatim',
+    latex2text = LatexNodes2Text(math_mode='text',  # unicode TODO: test if verbatim better
                                  strict_latex_spaces=True)
     nodelist, _pos, _len = walker.get_latex_nodes()
-    sections = []
+    sections = dict()
     current_content = []
     current_section = None
-    # print(nodelist)
+
+    abstract_section = re.compile(r'\\begin\{abstract\}((.|\n)+)\\end\{abstract\}')
+    sections['abstract'] = re.search(abstract_section, text).group(0)
+
+    # find 'document' EnvironmentNode
     for node in nodelist:
-        # print(node.nodeType())
         if node.isNodeType(LatexEnvironmentNode) and node.environmentname == 'document':
             doc_nodelist = node.nodelist
             break
-
-    if not doc_nodelist:
-        raise LatexWalkerError("No document node found in provided tex file. Is it a full latex document?")
+    else:
+        raise LatexWalkerError("No document node found in provided tex file. Is it a full latex document?")  # TODO: catch
 
     for node in doc_nodelist:
-        LOGGER.debug(node)
+        LOGGER.debug(f"node@for node in doc_nodelist: {node}")
         if node.isNodeType(LatexMacroNode) and node.macroname == 'section':
-            LOGGER.debug(node)
+            LOGGER.debug(f"node@if node.isNodeType(LatexMacroNode) and node.macroname == 'section': {node}")
             if current_section is not None:
-                sections.append((current_section, ''.join(LatexNodes2Text().nodelist_to_text(current_content))))
+                sections[current_section] = ''.join(latex2text.nodelist_to_text(current_content)).encode('utf8').decode('utf8')
             for n in node.nodeargd.argnlist:
-                LOGGER.debug(n)
+                LOGGER.debug(f"n@for n in node.nodeargd.argnlist: {n}")
                 if n is None:
                     continue
-                elif n.isNodeType(LatexGroupNode):
-                    print(n)
+                if n.isNodeType(LatexGroupNode):
+                    LOGGER.debug(f"n@for n in node.nodeargd.argnlist: {n}")
                     current_section = n.nodelist[0].chars
-            # print(current_section)
             current_content = []
         elif current_section is not None:
             current_content.append(node)
-            # if isinstance(node, LatexEnvironmentNode):
-            #     current_content.append(node.latex_verbatim())
-            # elif isinstance(node, LatexCharsNode):
-            #     current_content.append(node.chars)
     if current_section is not None:
-        sections.append((current_section, ''.join(latex2text.nodelist_to_text(current_content))))
+        sections[current_section] = ''.join(latex2text.nodelist_to_text(current_content)).encode('utf8').decode('utf8')
     return sections
 
 
-def parse_latex_file(filename):
-    # Open the LaTeX file
-    with open(filename, 'r') as f:
-        latex_text = f.read()
+def _parse_pdf(source_pdf_file: Path or str) -> (str, PyPDF2.DocumentInformation):
+    """Load pdf from local or remote source and parse it into plain text."""
+    s = Path(source_pdf_file)
 
-    abstract_section = r'\\begin\{abstract\}(?:.|\n)+\\end\{abstract\}'
-    abstract = re.findall(abstract_section, latex_text)[0]
+    if s.exists():
+        pdf_file = s
+    else:
+        pdf_file = Path("temp.pdf")
+        try:
+            # Download the PDF from the URLarticle_folder.joinpath(f"{article_id}/metadata.json")
+            response = requests.get(url=source_pdf_file)
+            with pdf_file.open("wb") as f:
+                f.write(response.content)
+        except requests.RequestException as ex:
+            LOGGER.warning(f"{ex}, returning ('', None)")
+            return '', None
 
-    # Find all section headings
-    section_regex = r'\\section\{(.+?)\}'
-    section_headings = re.findall(section_regex, latex_text)[1:]
+    # Open the PDF and parse the text
+    with open(pdf_file, "rb") as f:
+        LOGGER.info("Extracting text from PDF file (may take a while)...")
+        pdf = PyPDF2.PdfReader(f)
+        metadata = pdf.metadata
+        text = ""
+        for page_num in range(len(pdf.pages)):
+            page = pdf.pages[page_num]
+            text += page.extract_text()
 
-    # Split the LaTeX text into sections
-    sections = re.split(section_regex, latex_text)[1:]
+    # Clean up the temporary file
+    try:
+        os.remove("temp.pdf")
+    except FileNotFoundError:
+        LOGGER.info("temp.pdf didn't exist. Cleanup not necessary.")
 
-    return abstract, zip(section_headings, sections)
+    return text, metadata
 
 
-# def split_into_sections(text: str):
-#     """Split parsed pdf (plain text) into parts, which correspond to Sections of the article"""
-#     section_regex = r"\n(?P<section>[A-Z][A-Za-z\s]+)\n"
-#     sections = []
-#
-#     for match in re.finditer(section_regex, text):
-#         section_name = match.group("section")
-#         section_start = match.end()
-#         section_text = text[section_start:]
-#         next_match = re.search(section_regex, section_text)
-#         if next_match is not None:
-#             section_end = section_start + next_match.start()
-#         else:
-#             section_end = len(text)
-#         section_content = text[section_start:section_end]
-#         sections.append({"name": section_name, "content": section_content})
-#
-#     return sections
-
-def split_into_sections(text: str):
+def parse_pdf_file_and_split(source_pdf_file: Path or str) -> dict[str: str]:
     """Split parsed pdf (plain text) into parts, which correspond to Sections of the article"""
-    section_pattern = re.compile(r'^\s*(?P<section>[A-Z][^\\n]+)[\\n\\r]+', re.MULTILINE)
+    # TODO: it doesn't do a good job --> REWRITE
+    LOGGER.warning("Parsing from PDF is buggy and inefficient. "
+                   "It will most likely have undesirable results.\n"
+                   "Check if the provided article has available .tex source files on arXiv \n"
+                   " --> look for 'Other formats' under 'PDF' Download section on the article page. \n"
+                   "If Source (.tar.gz) are available, there is other problem, please report in Issues.")
+    source_file = Path(source_pdf_file)
+    text, metadata = _parse_pdf(source_file)
+
+    section_pattern = re.compile(r'^\s*(?P<section>[A-Z][^\n]+)[\n\r]+', re.MULTILINE)
     matches = section_pattern.finditer(text)
-    sections = []
+    sections = dict()
     for match in matches:
         section_title = match.group('section')
         section_text = text[match.end():] if match.end() < len(text) else ''
         next_match = section_pattern.search(section_text) if section_text else None
         section_end = next_match.start() if next_match else len(section_text)
         section_content = section_text[:section_end].strip()
-        sections.append((section_title, section_content))
+        sections[section_title] = section_content
     return sections

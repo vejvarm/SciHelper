@@ -16,7 +16,8 @@ import pinecone
 from pathlib import Path
 from time import time, sleep
 from uuid import uuid4
-from utils import parse_pdf, fetch_and_download_from_arxiv, parse_latex_file_and_split, _extract_arxiv_id
+from utils import _parse_pdf, fetch_and_download_from_arxiv, parse_latex_file_and_split, _extract_arxiv_id, \
+    choose_source_file_parser
 from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR
 
 logging.basicConfig(level=logging.INFO)
@@ -142,16 +143,19 @@ def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR):
         vector = vdb.fetch([metadata["vector_ids"]], namespace=NS.ARTICLES.value)  # TODO fetch all vectors for given article
         # TODO: load vectors connected to the article from vdb
     else:
-        fetch_and_download_from_arxiv(article_id, article_folder)
-    # WIP: parse from arxiv source files instead
-    text, _ = parse_pdf(article_folder.joinpath(metadata["id"]).joinpath("paper.pdf"))
-    sections = parse_latex_file_and_split(article_folder.joinpath(metadata["id"]).joinpath("tex").joinpath("main.tex"))
+        source_file_path = fetch_and_download_from_arxiv(article_id, article_folder)
+        parser = choose_source_file_parser(source_file_path)
+        sections = parser(source_file_path)
+        # sections = parse_latex_file_and_split(article_folder.joinpath(metadata["id"]).joinpath("tex").joinpath("main.tex"))
+
     # save article as vector into Pinecone
     # WIP: this might be a lot of information for one vector, we should split it
-    if vector is None:
-        vector = gpt3_embedding(text)
-        # TODO: as we have multiple vectors for one article, query by filtering article_id in metadata
-        vdb.upsert([(uuid4(), vector, {"article": article_id})], namespace=NS.ARTICLES.value)
+    for section_title, section_content in sections.items():
+        # TODO: continue here
+        if vector is None:
+            vector = gpt3_embedding(section_content)
+            # TODO: as we have multiple vectors for one article, query by filtering article_id or title in metadata
+            vdb.upsert([(uuid4(), vector, {"article": article_id, "title": section_title})], namespace=NS.ARTICLES.value)
 
     # TODO: continue here,
     #   we will need to send "prompt" through GPT and save the output
