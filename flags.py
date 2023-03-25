@@ -1,9 +1,9 @@
-import os
 from pathlib import Path
 from enum import Enum
 
 ROOT_DIR = Path(__file__).parent.absolute()
 ARTICLE_DIR = ROOT_DIR.joinpath("articles")
+LOG_DIR = ROOT_DIR.joinpath("gpt3_logs")
 
 
 class NS(Enum):

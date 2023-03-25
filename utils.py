@@ -6,7 +6,7 @@ import tarfile
 import requests
 import arxiv
 import PyPDF2
-from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexMacroNode, LatexCharsNode, LatexWalkerError, LatexGroupNode
+from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexMacroNode, LatexWalkerError, LatexGroupNode
 from pylatexenc.latex2text import LatexNodes2Text
 from pathlib import Path
 from flags import ROOT_DIR, ARTICLE_DIR
@@ -16,11 +16,32 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.WARNING)
 
 
+def cleanup_prompt(prompt: str):
+    return prompt.encode(encoding='ASCII', errors='ignore').decode().strip()
+
+
+def extract_text_from_completion_api_response(response: dict) -> str:
+    text = response['choices'][0]['text'].strip()
+    text = re.sub('[\r\n]+', '\n', text)
+    return re.sub('[\t ]+', ' ', text)
+
+
+def extract_text_from_chat_api_response(response: dict):
+    role = response['choices'][0]['message']['role']
+    text = response['choices'][0]['message']['content'].strip()
+    text = re.sub('[\r\n]+', '\n', text)
+    text = re.sub('[\t ]+', ' ', text)
+    return role, text
+
+
 def make_article_metadata(id: str, title="", authors: Sequence[str] = tuple("", ),
                           categories: Sequence[str] = tuple("", ), published="", journal_ref="",
-                          links: Sequence[str] = tuple("", ), url="",
-                          vector_ids: Sequence[str] = tuple("", ), summary=""):
-    """Helper function for creating metadata dictionary for json export. id field is mandatory as unique identifier."""
+                          links: Sequence[str] = tuple("", ), url="", summary="",
+                          section_summaries: dict[str: tuple[str]] = None):
+    """Helper function for creating metadata dictionary for json export. id field is mandatory as unique identifier.
+
+    :param section_summaries: (dict[str: tuple[str]]) e.g. {vector_id: (section_title, section_content), }
+    """
     return {"id": id.strip(),  # mandatory (ideally same as containing folder name)
             "title": str(title).strip(),
             "authors": tuple(authors),
@@ -29,8 +50,9 @@ def make_article_metadata(id: str, title="", authors: Sequence[str] = tuple("", 
             "journal_ref": str(journal_ref).strip(),
             "links": tuple(links),
             "url": str(url).strip(),
-            "vector_ids": tuple(vector_ids),  # Will be filled later when article is actually initialized and parsed
-            "summary": str(summary).strip()}
+            "summary": str(summary).strip(),
+            "section_summaries": dict() if section_summaries is None else section_summaries,   # Will be filled with GPT summaries and correspoding vector ids of sections
+            }
 
 
 def extract_tgz(source_archive: str or Path, extraction_folder: str or Path):
@@ -50,9 +72,8 @@ def extract_tgz(source_archive: str or Path, extraction_folder: str or Path):
         LOGGER.warning("No source files were extracted!")
 
 
-def _extract_arxiv_id(string):
+def extract_arxiv_id(string):
     pattern = r"(?:(?:arXiv:)?([0-9]{2}[0-1][0-9]\.[0-9]{4,5}(?:v[0-9]+)?|(?:[a-z|\-]+(\.[A-Z]{2})?\/\d{2}[0-1][0-9]\d{3})))"
-    # TODO: maybe ignore versions
     match = re.search(pattern, string.strip())
     if match:
         return match.group(1)
@@ -72,8 +93,8 @@ def _fetch_arxiv_article(article_id: str):
         return None
 
 
-def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sourcefiles_subfolder="tex") -> Path or None:
-    article_id = _extract_arxiv_id(article)
+def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sourcefiles_subfolder="tex") -> tuple[Path or None, dict]:
+    article_id = extract_arxiv_id(article)
     paper = _fetch_arxiv_article(article_id)
     metadata = make_article_metadata(id=article_id,
                                      title=paper.title,
@@ -95,17 +116,27 @@ def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sou
     LOGGER.info("... download complete")
 
     main_tex_file_path = specific_folder.joinpath(sourcefiles_subfolder).joinpath('main.tex')
+    all_tex_paths = list(specific_folder.joinpath(sourcefiles_subfolder).glob("**/*.tex"))
     pdf_file_path = specific_folder.joinpath("paper.pdf")
 
     if main_tex_file_path.exists():
         LOGGER.debug("returning path to 'main.tex'")
-        return main_tex_file_path
+        return main_tex_file_path, metadata
+    elif all_tex_paths:
+        for tex_path in all_tex_paths:
+            try:
+                _, _ = _parse_latex_file(tex_path)
+                LOGGER.info(f"returning path to '{tex_path}'")
+                return tex_path, metadata
+            except LatexWalkerError as err:
+                LOGGER.debug(f"{err} no document node found in {tex_path}")
+        LOGGER.warning("No 'document' nodes found in source tex files (most likely no .tex source files were fetched)")
     elif pdf_file_path.exists():
         LOGGER.debug("returning path to 'paper.pdf'")
-        return pdf_file_path
+        return pdf_file_path, metadata
     else:
         LOGGER.warning("No acceptable files (pdf or tex) for parsing were fetched.")
-        return None
+        return None, metadata
 
 
 def _resolve_auxilary_tex_files(source_text: str, source_folder: Path) -> str:
@@ -116,7 +147,7 @@ def _resolve_auxilary_tex_files(source_text: str, source_folder: Path) -> str:
     :param source_folder: Path to the source folder of the main.tex file
     :return parsed_text: source_text with all found instances of '\input{NAME}' replaced with the contents of their respective NAME.tex files
     """
-    pattern = r"\\input\{(.+)\}"  # TODO: reduce the . to only allowed characters in filename strings
+    pattern = r"\\input\{(.+?)(?:\.tex)?\}"  # TODO: reduce the . to only allowed characters in filename strings
     matches = re.findall(pattern, source_text)
     for match in matches:
         tex_file = match + '.tex'
@@ -144,7 +175,7 @@ def choose_source_file_parser(source_file: Union[Path, str]) -> Callable:
     """Validate if arXiv source file type is compatible with article parser and return appropriate parser function.
 
     The supported file types from arXiv are .tex and .pdf.
-    - if .tex, return parse_latex_file_and_split()
+    - if .tex, return split_parsed_latex_file()
     - if .pdf, return parse_pdf_file_and_split()
 
     :param source_file: path to arXiv source file (main.tex or {article_id}.pdf)
@@ -153,7 +184,7 @@ def choose_source_file_parser(source_file: Union[Path, str]) -> Callable:
     """
     source_file = Path(source_file)
     if source_file.suffix == ".tex":
-        return parse_latex_file_and_split
+        return split_parsed_latex_file
     elif source_file.suffix == ".pdf":
         return parse_pdf_file_and_split
     else:
@@ -170,13 +201,7 @@ def _read_text_from_file(source_tex_file: Path or str) -> str:
         return ''
 
 
-def parse_latex_file_and_split(source_tex_file: Path or str) -> dict[str: str]:
-    """ Function that parses a provided latex document file and splits it by \section{...} nodes of the document
-    :param tex: path to main LaTeX file of the article. Usually should be called main.tex
-    :return sections (dict[section name: section content]): section names and contents parsed in plain text (unicode)
-    """
-    # DONE (critical): add support for parsing `\input{1_intro}` files into `main.tex`
-    # TODO (normal): add support for citations (currently the parsed content has `<cit.>` everywhere)
+def _parse_latex_file(source_tex_file: Path or str):
     source_file = Path(source_tex_file)
     text = _read_text_from_file(source_file)
 
@@ -185,15 +210,7 @@ def parse_latex_file_and_split(source_tex_file: Path or str) -> dict[str: str]:
     LOGGER.debug(text)
 
     walker = LatexWalker(text)
-    latex2text = LatexNodes2Text(math_mode='text',  # unicode TODO: test if verbatim better
-                                 strict_latex_spaces=True)
     nodelist, _pos, _len = walker.get_latex_nodes()
-    sections = dict()
-    current_content = []
-    current_section = None
-
-    abstract_section = re.compile(r'\\begin\{abstract\}((.|\n)+)\\end\{abstract\}')
-    sections['abstract'] = re.search(abstract_section, text).group(0)
 
     # find 'document' EnvironmentNode
     for node in nodelist:
@@ -203,12 +220,34 @@ def parse_latex_file_and_split(source_tex_file: Path or str) -> dict[str: str]:
     else:
         raise LatexWalkerError("No document node found in provided tex file. Is it a full latex document?")  # TODO: catch
 
+    abstract_section = re.compile(r'\\begin\{abstract\}((.|\n)+)\\end\{abstract\}')
+    sections = {'abstract': re.search(abstract_section, text).group(0)}
+
+    return sections, doc_nodelist
+
+
+def split_parsed_latex_file(source_tex_file: Path or str) -> dict[str: str]:
+    """ Function that parses a provided latex document file and splits it by \section{...} nodes of the document
+    :param tex: path to main LaTeX file of the article. Usually should be called main.tex
+    :return sections (dict[section name: section content]): section names and contents parsed in plain text (unicode)
+    """
+    # DONE (critical): add support for parsing `\input{1_intro}` files into `main.tex`
+    # TODO (normal): add support for citations (currently the parsed content has `<cit.>` everywhere)
+    # return doc_nodelist, sections,
+    # latex2text
+    latex2text = LatexNodes2Text(math_mode='text',  # unicode TODO: test if verbatim better
+                                 fill_text=False,
+                                 strict_latex_spaces=True)  # TODO: replace excessive /n characters
+    current_content = []
+    current_section = None
+    sections, doc_nodelist = _parse_latex_file(source_tex_file)
+
     for node in doc_nodelist:
         LOGGER.debug(f"node@for node in doc_nodelist: {node}")
         if node.isNodeType(LatexMacroNode) and node.macroname == 'section':
             LOGGER.debug(f"node@if node.isNodeType(LatexMacroNode) and node.macroname == 'section': {node}")
             if current_section is not None:
-                sections[current_section] = ''.join(latex2text.nodelist_to_text(current_content)).encode('utf8').decode('utf8')
+                sections[current_section.strip()] = ''.join(latex2text.nodelist_to_text(current_content)).strip()
             for n in node.nodeargd.argnlist:
                 LOGGER.debug(f"n@for n in node.nodeargd.argnlist: {n}")
                 if n is None:
@@ -220,7 +259,7 @@ def parse_latex_file_and_split(source_tex_file: Path or str) -> dict[str: str]:
         elif current_section is not None:
             current_content.append(node)
     if current_section is not None:
-        sections[current_section] = ''.join(latex2text.nodelist_to_text(current_content)).encode('utf8').decode('utf8')
+        sections[current_section.strip()] = ''.join(latex2text.nodelist_to_text(current_content)).strip()
     return sections
 
 
@@ -280,5 +319,5 @@ def parse_pdf_file_and_split(source_pdf_file: Path or str) -> dict[str: str]:
         next_match = section_pattern.search(section_text) if section_text else None
         section_end = next_match.start() if next_match else len(section_text)
         section_content = section_text[:section_end].strip()
-        sections[section_title] = section_content
+        sections[section_title.strip()] = section_content.strip()
     return sections

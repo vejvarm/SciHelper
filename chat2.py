@@ -1,12 +1,17 @@
-# TODO: Forgetting (merging/deleting vectors that are similar to each other)
-# TODO: Weighting of different memories (how?)
-# TODO: considering negative prompts. Is that possible?
+# DONE: save article sections locally for fetching (in metadata.json)
+# DONE: save and fetch vectors via Pinecone ()
+# DONE: MIGRATE to ChatCompletion instead of Completion to save API tokens
+# TODO:0 !!! if section_content longer than some maximum, split it into two and recursively run with summary of the previous sections attached
+# TODO:0 @line215 TypeError: object of type 'UUID' has no len()
 
-# TODO: split papers into multiple smaller chunks (vectorize those and save into files for retrieval)
-# TODO: use local Alpaca instead of ChatGPT (https://github.com/tloen/alpaca-lora)
+# TODO:1 Forgetting (merging/deleting vectors that are similar to each other)
+# TODO:1 Weighting of different memories (how?)
+# TODO:1 considering negative prompts. Is that possible?
+# DONE:1 split papers into multiple smaller chunks (vectorize those and save into files for retrieval)
+
+# TODO:3 use local Alpaca instead of ChatGPT (https://github.com/tloen/alpaca-lora)
 import logging
 import os
-import uuid
 
 import openai
 import json
@@ -16,9 +21,9 @@ import pinecone
 from pathlib import Path
 from time import time, sleep
 from uuid import uuid4
-from utils import _parse_pdf, fetch_and_download_from_arxiv, parse_latex_file_and_split, _extract_arxiv_id, \
-    choose_source_file_parser
-from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR
+from utils import cleanup_prompt, extract_text_from_completion_api_response, extract_text_from_chat_api_response, \
+    fetch_and_download_from_arxiv, extract_arxiv_id, choose_source_file_parser
+from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR, LOG_DIR
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -57,7 +62,7 @@ def gpt3_embedding(content, engine='text-embedding-ada-002'):
 def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, tokens=1000, freq_pen=0.0, pres_pen=0.0, stop=['USER:', 'SciHelper:']):
     max_retry = 5
     retry = 0
-    prompt = prompt.encode(encoding='ASCII', errors='ignore').decode()
+    prompt = cleanup_prompt(prompt)
     while True:
         try:
             response = openai.Completion.create(
@@ -69,14 +74,57 @@ def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, toke
                 frequency_penalty=freq_pen,
                 presence_penalty=pres_pen,
                 stop=stop)
-            text = response['choices'][0]['text'].strip()
-            text = re.sub('[\r\n]+', '\n', text)
-            text = re.sub('[\t ]+', ' ', text)
+            text = extract_text_from_completion_api_response(response)
             filename = '%s_gpt3.txt' % time()
             if not os.path.exists('gpt3_logs'):
                 os.makedirs('gpt3_logs')
             save_file('gpt3_logs/%s' % filename, prompt + '\n\n==========\n\n' + text)
             return text
+        except Exception as oops:
+            retry += 1
+            if retry >= max_retry:
+                return "GPT3 error: %s" % oops
+            print('Error communicating with OpenAI:', oops)
+            sleep(1)
+
+
+def gpt3_chat_completion(conversation: list[dict[str: str]], model="gpt-3.5-turbo", log_folder=LOG_DIR) -> list[dict]:
+    """ provide completion output from chat-gpt api given a list of messages (dicts) in the current conversation
+
+    :param conversation: list of conversation turns (dicts).
+        keys are "role" (:"system", "assistant" or "user") and "content" (: message_string)
+
+        example conversation input:
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Who won the world series in 2020?"},
+            {"role": "assistant", "content": "The Los Angeles Dodgers won the World Series in 2020."},
+            {"role": "user", "content": "Where was it played?"}
+        ]
+    :param model: (str) name of openai gpt api model to use for completion
+    :param log_folder: (str or Path) path to log folder for conversations
+
+    :return: updated conversation list of message dictionaries with new message included
+    """
+    max_retry = 5
+    retry = 0
+
+    # NOTE: dont forget to clean up the user prompts before putting them into conversation dict
+
+    log_fldr = Path(log_folder)
+    log_fldr.mkdir(exist_ok=True)
+
+    while True:
+        try:
+            response = openai.ChatCompletion.create(
+                model=model,
+                messages=conversation,
+            )
+            role, content = extract_text_from_chat_api_response(response)
+            conversation.append({"role": role, "content": content})
+            filename = f'{time()}_chatgpt3.json'
+            json.dump(conversation, log_fldr.joinpath(filename).open('w'), indent=4)
+            return conversation
         except Exception as oops:
             retry += 1
             if retry >= max_retry:
@@ -110,7 +158,6 @@ def initialize_conversation(vdb, init_json_path="nexus/user-init.json"):
     if json_path.exists():
         print("Welcome back! My name is SciHelper. I am here to help you with your research. Let's continue our adventure!\n")
         metadata = json.load(json_path.open("r"))
-        message = metadata["message"]
         vector = vdb.fetch([id], namespace=NS.USER_INIT.value)
         # TODO: add user-bio reset option
     else:
@@ -129,40 +176,46 @@ def initialize_conversation(vdb, init_json_path="nexus/user-init.json"):
         save_json(json_path, metadata)
         vdb.upsert([(id, vector)], namespace=NS.USER_INIT.value)  # upload to Pinecone
 
-    # send init to GPT API
-    output = gpt3_completion(message)
-    LOGGER.info(output)
+    # # send init to GPT API
+    # output = gpt3_completion(message)
+    # LOGGER.info(output)
 
-    return output, vector, metadata
+    return vector, metadata
 
 
-def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR):
-    vector = None
-    if article_folder.joinpath(f"{article_id}/metadata.json").exists():
-        metadata = json.load(article_folder.joinpath(f"{article_id}/metadata.json").open("r"))
-        vector = vdb.fetch([metadata["vector_ids"]], namespace=NS.ARTICLES.value)  # TODO fetch all vectors for given article
-        # TODO: load vectors connected to the article from vdb
+def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api=True):
+    vectors = []
+    path_to_metadata = article_folder.joinpath(f"{article_id}/metadata.json")
+    if path_to_metadata.exists():
+        metadata = json.load(path_to_metadata.open("r"))
     else:
-        source_file_path = fetch_and_download_from_arxiv(article_id, article_folder)
+        source_file_path, metadata = fetch_and_download_from_arxiv(article_id, article_folder)
         parser = choose_source_file_parser(source_file_path)
         sections = parser(source_file_path)
-        # sections = parse_latex_file_and_split(article_folder.joinpath(metadata["id"]).joinpath("tex").joinpath("main.tex"))
 
-    # save article as vector into Pinecone
-    # WIP: this might be a lot of information for one vector, we should split it
-    for section_title, section_content in sections.items():
-        # TODO: continue here
-        if vector is None:
-            vector = gpt3_embedding(section_content)
+        # TODO: utilize ASYNC/threading for multiple parallel requests as this is very slow
+        # summarize article sections and save the vector representations into Pinecone
+        for section_title, section_content in sections.items():
+            # compress article sections into concise summaries
+            prompt = open_file('prompt_summarize.txt').replace('<<TEXT>>', f"{section_title}\n{section_content}")
+            if use_chat_api:
+                # use chat completion api (chatgpt)
+                # TODO:0 !!! if section_content longer than some maximum, split it into two and recursively run with summary of the previous sections attached
+                conversation = [{"role": "system", "content": cleanup_prompt(prompt)}, ]
+                LOGGER.debug(conversation)
+                summary = gpt3_chat_completion(conversation)[-1]["content"]
+            else:
+                # use text completion api (davinci)
+                summary = gpt3_completion(prompt).strip()
+            vector_id = uuid4()
+            vectors.append((vector_id, gpt3_embedding(summary), {"article": article_id, "title": section_title}))
+            metadata['section_summaries'][vector_id] = (section_title, summary)
             # TODO: as we have multiple vectors for one article, query by filtering article_id or title in metadata
-            vdb.upsert([(uuid4(), vector, {"article": article_id, "title": section_title})], namespace=NS.ARTICLES.value)
 
-    # TODO: continue here,
-    #   we will need to send "prompt" through GPT and save the output
-    prompt = open_file('prompt_article.txt').replace('<<ARTICLE>>', text)
-    output = gpt3_completion(prompt)
+        vdb.upsert(vectors, namespace=NS.ARTICLES.value)
+        json.dump(metadata, path_to_metadata.open("w"))
 
-    return output, vector, metadata
+    return metadata
 
 
 def conversation_turn(speaker: str, message: str, payload: list[tuple[str, float]],
@@ -195,7 +248,7 @@ def prompt_for_article():
     while True:
         usr_input = input("Please give me a valid ArXiv article address or ID: ")
 
-        article_id = _extract_arxiv_id(usr_input)  # TODO async: start downloading immediately
+        article_id = extract_arxiv_id(usr_input)  # TODO async: start downloading immediately
 
         if article_id:
             print("Thank you!")
@@ -215,9 +268,19 @@ if __name__ == '__main__':
 
     # initialize article
     article_id = prompt_for_article()
-    initialize_article(vdb, article_id)
-    # TODO: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
+    metadata = initialize_article(vdb, article_id)
+    # NOTE: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
     #   when we have web-ui, we can use a button for this
+
+    print(metadata)
+
+    # fetch all vectors for given article
+    vectors = vdb.fetch([metadata["section_summaries"].keys()], namespace=NS.ARTICLES.value)
+    print(vectors)
+    exit()
+
+    # TODO: utilize summarized article in further user queries
+    #   - NOTE: maybe summarize the summaries one more time for ultimate summary that saves us api tokens
 
     while True:
         #### get user input, save it, vectorize it, save to pinecone

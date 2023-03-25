@@ -1,0 +1,5 @@
+Given a scientific text provided to you, summarize it in a detailed manner within 300 words, while retaining all necessary information and context. The summary should include any results or unique conclusions from the scientific text. Technical terms, acronyms, and abbreviations should be explained within the summary. The summary should follow the APA style and be reviewed for accuracy, completeness, and clarity. The summary can use a combination of paragraphs, bullet points, and tables to increase readability and comprehension. Tables and figure captions will be provided as part of the text. The tone of the summary should be neutral, and only the facts presented in the text should be reported.
+---
+<<TEXT>>
+---
+BEGIN:
