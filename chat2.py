@@ -16,17 +16,18 @@ import os
 import openai
 import json
 import re
-import datetime
+from datetime import datetime
 import pinecone
 from pathlib import Path
 from time import time, sleep
 from uuid import uuid4
 from utils import cleanup_prompt, extract_text_from_completion_api_response, extract_text_from_chat_api_response, \
     fetch_and_download_from_arxiv, extract_arxiv_id, choose_source_file_parser
-from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR, LOG_DIR
+from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR, LOG_DIR, NEXUS_DIR, TIME_FORMAT
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
+
 
 def open_file(filepath):
     with open(filepath, 'r', encoding='utf-8') as infile:
@@ -49,17 +50,18 @@ def save_json(filepath, payload):
 
 
 def timestamp_to_datetime(unix_time):
-    return datetime.datetime.fromtimestamp(unix_time).strftime("%A, %B %d, %Y at %I:%M%p %Z")
+    return datetime.fromtimestamp(unix_time).strftime("%A, %B %d, %Y at %I:%M%p %Z")
 
 
 def gpt3_embedding(content, engine='text-embedding-ada-002'):
-    content = content.encode(encoding='ASCII',errors='ignore').decode()  # fix any UNICODE errors
-    response = openai.Embedding.create(input=content,engine=engine)
+    content = content.encode(encoding='ASCII', errors='ignore').decode()  # fix any UNICODE errors
+    response = openai.Embedding.create(input=content, engine=engine)
     vector = response['data'][0]['embedding']  # this is a normal list
     return vector
 
 
-def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, tokens=1000, freq_pen=0.0, pres_pen=0.0, stop=['USER:', 'SciHelper:']):
+def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, tokens=1000, freq_pen=0.0, pres_pen=0.0,
+                    stop=['USER:', 'SciHelper:']):
     max_retry = 5
     retry = 0
     prompt = cleanup_prompt(prompt)
@@ -151,36 +153,40 @@ def load_articles(results):
     return top_k_list
 
 
-def initialize_conversation(vdb, init_json_path="nexus/user-init.json"):
+def initialize_user(vdb, init_json_path="nexus/user-init.json", role='system'):
     assert init_json_path.endswith(".json")
     json_path = Path(init_json_path)
     id = json_path.name.removesuffix(".json")
     if json_path.exists():
-        print("Welcome back! My name is SciHelper. I am here to help you with your research. Let's continue our adventure!\n")
-        metadata = json.load(json_path.open("r"))
+        print(
+            "Welcome back! My name is SciHelper. I am here to help you with your research. Let's continue our adventure!\n")
+        user_metadata = json.load(json_path.open("r"))
         vector = vdb.fetch([id], namespace=NS.USER_INIT.value)
         # TODO: add user-bio reset option
     else:
         print('\nWelcome, my name is SciHelper. I am here to help you with your research. And you are?\n')
-        user_bio = input('Please provide a short background on and preferred areas of your research:\n')
+        user_bio = input('Please introduce yourself and your research background as well as preferred research areas:\n')
         print("\n\nThank you! I will remember that!")
-        user_goals = input("\nI'd also love to have a list of goals or expectations of your research:\n")
+        user_goals = input("\nAnd one more thing. What are the aims and goals of your current research?\n")
         print("\n\nThank you! Now let's research something wonderful together!")
         message = open_file('prompt_init.txt').replace('<<USER_BIO>>', user_bio).replace('<<USER_GOALS>>', user_goals)
+
+        conversation = gpt3_chat_completion([{"role": role, "content": message}])
+        summary = conversation[-1]["content"]
 
         timestamp = time()
         timestring = timestamp_to_datetime(timestamp)
         # message = '%s: %s - %s' % ('USER', timestring, a)
         vector = gpt3_embedding(message)
-        metadata = {'speaker': 'INIT', 'time': timestamp, 'message': message, 'timestring': timestring, 'uuid': id}
-        save_json(json_path, metadata)
+        user_metadata = {'role': role, 'time': timestamp, 'bio': summary, 'timestring': timestring, 'uuid': id}
+        save_json(json_path, user_metadata)
         vdb.upsert([(id, vector)], namespace=NS.USER_INIT.value)  # upload to Pinecone
 
     # # send init to GPT API
     # output = gpt3_completion(message)
     # LOGGER.info(output)
 
-    return vector, metadata
+    return vector, user_metadata
 
 
 def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api=True):
@@ -207,8 +213,9 @@ def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api
             else:
                 # use text completion api (davinci)
                 summary = gpt3_completion(prompt).strip()
-            vector_id = uuid4()
-            vectors.append((vector_id, gpt3_embedding(summary), {"article": article_id, "title": section_title}))
+            vector_id = uuid4().hex
+            vectors.append((vector_id, gpt3_embedding(summary), {"article": article_id,  # TODO: pinecone identifies this as DATETIME type uff
+                                                                 "title": section_title}))  # NOTE: title might be unnecessary, we already have it in metadata
             metadata['section_summaries'][vector_id] = (section_title, summary)
             # TODO: as we have multiple vectors for one article, query by filtering article_id or title in metadata
 
@@ -218,12 +225,83 @@ def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api
     return metadata
 
 
+def fetch_similar_sections(vdb, vector, namespace=NS.ARTICLES.value, top_k=10, score_cutoff=0.5, include_values=True,
+                           include_metadata=True):
+    """ Fetches maximum of 'top_k' number of article sections with similar semantic meaning.
+    If similarity score is < score_cutoff, then the respective article section is not included in results.
+
+
+    :param vdb: (pinecone.Index) pinecone vector database index object
+    :param vector: (list[float]) vector by which we search similar ones, list of float values
+    :param namespace: (str: NS.ARTICLES.value) index namespace to search within
+    :param top_k: (int: 10)maximum number of results found
+    :param score_cutoff: (float: 0.5) similarity score threshold, if score is lower than cutoff, respective match is discarded
+    :param include_values: (bool: True), whether match should include vector values
+    :param include_metadata: (bool: True), whether match should include metadata
+    :return: (list[dict]) matches with similarity score above the cutoff in a list of dictionaries
+     example output: [
+        {
+          "id": str,
+          "score": score_cutoff < float < 1,
+          "values": [float],
+          "sparseValues": {
+            "indices": [int, ...],
+            "values": [float, ...]
+          },
+          "metadata": {str: str}
+        },
+        ...
+     ]
+    """
+    response = vdb.query(namespace=namespace,
+                         top_k=top_k,
+                         include_values=include_values,
+                         include_metadata=include_metadata,
+                         vector=vector)
+    filtered_matches = []
+    for match in response['matches']:
+        score = match['score']
+        if score >= score_cutoff:
+            filtered_matches.append(match)
+
+    return filtered_matches
+
+
+def fetch_article_sections(article_id: str, vector_ids: list[str]) -> list[tuple[str, str]]:
+    """ fetch specific section with 'vector_id' from article with 'article_id'
+
+    :param article_id: (str) id of a containing article
+    :param vector_ids: list[str] ids of the specific sections we want to fetch
+    :return: (section_title, summary)
+    """
+    try:
+        metadata = json.load(ARTICLE_DIR.joinpath(article_id).joinpath("metadata.json").open("r"))
+        return [tuple(metadata['section_summaries'][vid]) for vid in vector_ids]
+    except FileNotFoundError as err:
+        LOGGER.warning(f"{err}. Returning empty list")
+        return []
+
+
+def new_conversation(user_bio: str, nexus_folder=NEXUS_DIR):
+    nexus_folder.mkdir(exist_ok=True)
+
+    timestring = datetime.now().strftime(TIME_FORMAT)
+    conv_id = f"{timestring}_{uuid4().hex}"
+
+    conversation = [{"role": "system", "content": user_bio}]
+
+    with nexus_folder.joinpath(f"{conv_id}.json").open("w") as f:
+        json.dump(conversation, f, ensure_ascii=True, indent=4)
+
+    return conv_id, conversation
+
+
 def conversation_turn(speaker: str, message: str, payload: list[tuple[str, float]],
                       n_top_convos=N_TOP_CONVOS, n_top_articles=N_TOP_ARTICLES):
     timestamp = time()
     timestring = timestamp_to_datetime(timestamp)
 
-    unique_id = str(uuid4())
+    unique_id = uuid4().hex
     metadata = {'speaker': speaker, 'time': timestamp, 'message': message, 'timestring': timestring, 'uuid': unique_id}
     save_json('nexus/%s.json' % unique_id, metadata)
     vector = gpt3_embedding(message)
@@ -235,9 +313,12 @@ def conversation_turn(speaker: str, message: str, payload: list[tuple[str, float
         # search for relevant messages, and generate a response
         prev_convos = vdb.query(vector=vector, top_k=n_top_convos, namespace=NS.CONVOS.value)
         prev_articles = vdb.query(vector=vector, top_k=n_top_articles, namespace=NS.ARTICLES.value)
-        conversation = load_conversation(prev_convos)  # results should be a DICT with 'matches' which is a LIST of DICTS, with 'id'
-        article_ids = load_articles(prev_articles)  # TODO: now what do we actually do with these?, we should cache the article texts I guess
-        prompt = open_file('prompt_response.txt').replace('<<CONVERSATION>>', conversation).replace('<<MESSAGE>>', message)
+        conversation = load_conversation(
+            prev_convos)  # results should be a DICT with 'matches' which is a LIST of DICTS, with 'id'
+        article_ids = load_articles(
+            prev_articles)  # TODO: now what do we actually do with these?, we should cache the article texts I guess
+        prompt = open_file('prompt_response.txt').replace('<<CONVERSATION>>', conversation).replace('<<MESSAGE>>',
+                                                                                                    message)
         # generate response, vectorize, save, etc
         output = gpt3_completion(prompt)
 
@@ -264,7 +345,14 @@ if __name__ == '__main__':
     vdb = pinecone.Index("llm-ltm")
 
     # ask for user bio and preferences, if they don't exist already
-    initialize_conversation(vdb)
+    user_vector, user_metadata = initialize_user(vdb)
+    user_bio_summary = user_metadata["bio"]
+    print(user_metadata["bio"])
+
+    # new conversation
+    conv_id, conversation = new_conversation(user_bio_summary)
+    # NOTE: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
+    #   when we have web-ui, we can use a button for this
 
     # initialize article
     article_id = prompt_for_article()
@@ -275,9 +363,11 @@ if __name__ == '__main__':
     print(metadata)
 
     # fetch all vectors for given article
-    vectors = vdb.fetch([metadata["section_summaries"].keys()], namespace=NS.ARTICLES.value)
-    print(vectors)
+    vectors = vdb.fetch(list(metadata["section_summaries"].keys()), namespace=NS.ARTICLES.value)
+    print(list(v['metadata']['article'] for v in vectors['vectors'].values()))
     exit()
+    # v3_out['vectors'][id]['values']  # vector values
+    # v3_out['vectors'][id]['metadata']  # vector metadata
 
     # TODO: utilize summarized article in further user queries
     #   - NOTE: maybe summarize the summaries one more time for ultimate summary that saves us api tokens
