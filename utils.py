@@ -20,6 +20,27 @@ def cleanup_prompt(prompt: str):
     return prompt.encode(encoding='ASCII', errors='ignore').decode().strip()
 
 
+def pineconize(article_id: str):
+    """ as pinecone thinks that article names from arxiv are actually datetime objects, we need to replace dots with
+    something else
+
+    :param article_id: (str) id of article in the format \d{4}.\d{4,5}
+    :return: (str) id of article with '.' replaced by '!'
+    """
+
+    return article_id.replace('.', '!')
+
+
+def depineconize(pineconized_id: str):
+    """
+    Reverses the transformation applied by the pineconize function.
+
+    :param pineconized_id: (str) id of an article with '!' instead of '.'
+    :return: (str) the original article id with '.' instead of '!'
+    """
+    return pineconized_id.replace('!', '.')
+
+
 def extract_text_from_completion_api_response(response: dict) -> str:
     text = response['choices'][0]['text'].strip()
     text = re.sub('[\r\n]+', '\n', text)

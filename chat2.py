@@ -22,7 +22,7 @@ from pathlib import Path
 from time import time, sleep
 from uuid import uuid4
 from utils import cleanup_prompt, extract_text_from_completion_api_response, extract_text_from_chat_api_response, \
-    fetch_and_download_from_arxiv, extract_arxiv_id, choose_source_file_parser
+    fetch_and_download_from_arxiv, extract_arxiv_id, choose_source_file_parser, pineconize, depineconize
 from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR, LOG_DIR, NEXUS_DIR, TIME_FORMAT
 
 logging.basicConfig(level=logging.INFO)
@@ -189,8 +189,7 @@ def initialize_user(vdb, init_json_path="nexus/user-init.json", role='system'):
     return vector, user_metadata
 
 
-def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api=True):
-    vectors = []
+def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api=True) -> (dict, dict):
     path_to_metadata = article_folder.joinpath(f"{article_id}/metadata.json")
     if path_to_metadata.exists():
         metadata = json.load(path_to_metadata.open("r"))
@@ -198,6 +197,7 @@ def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api
         source_file_path, metadata = fetch_and_download_from_arxiv(article_id, article_folder)
         parser = choose_source_file_parser(source_file_path)
         sections = parser(source_file_path)
+        vector_list = []
 
         # TODO: utilize ASYNC/threading for multiple parallel requests as this is very slow
         # summarize article sections and save the vector representations into Pinecone
@@ -214,15 +214,17 @@ def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api
                 # use text completion api (davinci)
                 summary = gpt3_completion(prompt).strip()
             vector_id = uuid4().hex
-            vectors.append((vector_id, gpt3_embedding(summary), {"article": article_id,  # TODO: pinecone identifies this as DATETIME type uff
+            vector_list.append((vector_id, gpt3_embedding(summary), {"article": pineconize(article_id),  # TODO: pinecone identifies this as DATETIME type uff
                                                                  "title": section_title}))  # NOTE: title might be unnecessary, we already have it in metadata
             metadata['section_summaries'][vector_id] = (section_title, summary)
             # TODO: as we have multiple vectors for one article, query by filtering article_id or title in metadata
 
-        vdb.upsert(vectors, namespace=NS.ARTICLES.value)
+        vdb.upsert(vector_list, namespace=NS.ARTICLES.value)
         json.dump(metadata, path_to_metadata.open("w"))
 
-    return metadata
+    vectors = vdb.fetch(list(metadata["section_summaries"].keys()), namespace=NS.ARTICLES.value)
+
+    return metadata, vectors
 
 
 def fetch_similar_sections(vdb, vector, namespace=NS.ARTICLES.value, top_k=10, score_cutoff=0.5, include_values=True,
@@ -275,7 +277,7 @@ def fetch_article_sections(article_id: str, vector_ids: list[str]) -> list[tuple
     :return: (section_title, summary)
     """
     try:
-        metadata = json.load(ARTICLE_DIR.joinpath(article_id).joinpath("metadata.json").open("r"))
+        metadata = json.load(ARTICLE_DIR.joinpath(depineconize(article_id)).joinpath("metadata.json").open("r"))
         return [tuple(metadata['section_summaries'][vid]) for vid in vector_ids]
     except FileNotFoundError as err:
         LOGGER.warning(f"{err}. Returning empty list")
@@ -356,15 +358,14 @@ if __name__ == '__main__':
 
     # initialize article
     article_id = prompt_for_article()
-    metadata = initialize_article(vdb, article_id)
+    article_metadata, article_vectors = initialize_article(vdb, article_id)
     # NOTE: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
     #   when we have web-ui, we can use a button for this
 
-    print(metadata)
+    print(article_metadata)
 
     # fetch all vectors for given article
-    vectors = vdb.fetch(list(metadata["section_summaries"].keys()), namespace=NS.ARTICLES.value)
-    print(list(v['metadata']['article'] for v in vectors['vectors'].values()))
+    print(list(depineconize(v['metadata']['article']) for v in article_vectors['vectors'].values()))
     exit()
     # v3_out['vectors'][id]['values']  # vector values
     # v3_out['vectors'][id]['metadata']  # vector metadata
