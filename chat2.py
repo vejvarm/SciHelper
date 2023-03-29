@@ -12,18 +12,22 @@
 # TODO:3 use local Alpaca instead of ChatGPT (https://github.com/tloen/alpaca-lora)
 import logging
 import os
+from collections import defaultdict
 
 import openai
 import json
+import jsonlines
 import re
 from datetime import datetime
 import pinecone
 from pathlib import Path
 from time import time, sleep
 from uuid import uuid4
-from utils import cleanup_prompt, extract_text_from_completion_api_response, extract_text_from_chat_api_response, \
-    fetch_and_download_from_arxiv, extract_arxiv_id, choose_source_file_parser, pineconize, depineconize
-from flags import NS, N_TOP_ARTICLES, N_TOP_CONVOS, ARTICLE_DIR, LOG_DIR, NEXUS_DIR, TIME_FORMAT
+from utils import handle_flag, cleanup_prompt, extract_text_from_completion_api_response, \
+    extract_text_from_chat_api_response, fetch_and_download_from_arxiv, extract_arxiv_id, choose_source_file_parser, \
+    pineconize, depineconize
+from flags import NS, N_TOP_SECTIONS, N_TOP_CONVOS, ARTICLE_DIR, LOG_DIR, NEXUS_DIR, TIME_FORMAT, N_MAX_WORDS_IN_CONV, \
+    DEFAULT_EMBEDDING_ENGINE, GENERATE_SUMMARY
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -53,11 +57,15 @@ def timestamp_to_datetime(unix_time):
     return datetime.fromtimestamp(unix_time).strftime("%A, %B %d, %Y at %I:%M%p %Z")
 
 
-def gpt3_embedding(content, engine='text-embedding-ada-002'):
+def gpt3_embedding(content: str, engine=DEFAULT_EMBEDDING_ENGINE):
     content = content.encode(encoding='ASCII', errors='ignore').decode()  # fix any UNICODE errors
     response = openai.Embedding.create(input=content, engine=engine)
     vector = response['data'][0]['embedding']  # this is a normal list
     return vector
+
+
+def conversation2string(convo: list[dict[str: str, str: str]]) -> str:
+    return '\n\n'.join([f"{c['role']}:\n{c['content']}" for c in convo])
 
 
 def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, tokens=1000, freq_pen=0.0, pres_pen=0.0,
@@ -124,25 +132,41 @@ def gpt3_chat_completion(conversation: list[dict[str: str]], model="gpt-3.5-turb
             )
             role, content = extract_text_from_chat_api_response(response)
             conversation.append({"role": role, "content": content})
-            filename = f'{time()}_chatgpt3.json'
-            json.dump(conversation, log_fldr.joinpath(filename).open('w'), indent=4)
+            filename = f'{datetime.now().strftime(TIME_FORMAT)}_chatgpt3.jsonl'
+            with jsonlines.open(log_fldr.joinpath(filename), mode="a") as writer:
+                writer.write_all(conversation[-2:])
             return conversation
         except Exception as oops:
             retry += 1
             if retry >= max_retry:
                 return "GPT3 error: %s" % oops
-            print('Error communicating with OpenAI:', oops)
+            LOGGER.warning('Error communicating with OpenAI:', oops)
             sleep(1)
 
 
-def load_conversation(results):
-    result = list()
-    for m in results['matches']:
-        info = load_json('nexus/%s.json' % m['id'])
-        result.append(info)
-    ordered = sorted(result, key=lambda d: d['time'], reverse=False)  # sort them all chronologically
-    messages = [i['message'] for i in ordered]
-    return '\n'.join(messages).strip()
+def load_conversation(matches: list[dict[str: str]], nexus_folder=NEXUS_DIR) -> list:
+    """
+
+    :param matches: results from vdb query  for convos (should be list of dicts with key "id")
+    :param nexus_folder: folder in which conversations are stored
+    :return: list[dict["role": str, "content": str]] ... joined list of conversations
+             [] if no matches found
+    """
+    nexus_folder = Path(nexus_folder)
+    convo_list = list()
+    for m in matches:
+        try:
+            with jsonlines.Reader(nexus_folder.joinpath(f"{m['id']}.jsonl").open("r")) as reader:
+                info = reader.iter()
+                convo_list.extend(info)
+        except FileNotFoundError as err:
+            LOGGER.warning(f"(skipping) m in matches@load_conversation: {err}")
+            continue
+        except KeyError as err:
+            LOGGER.warning(f"(skipping) m in matches@load_conversation: KeyError({err})")
+            continue
+    LOGGER.debug(f"convo_list@load_conversation: {convo_list}")
+    return convo_list
 
 
 def load_articles(results):
@@ -165,7 +189,8 @@ def initialize_user(vdb, init_json_path="nexus/user-init.json", role='system'):
         # TODO: add user-bio reset option
     else:
         print('\nWelcome, my name is SciHelper. I am here to help you with your research. And you are?\n')
-        user_bio = input('Please introduce yourself and your research background as well as preferred research areas:\n')
+        user_bio = input(
+            'Please introduce yourself and your research background as well as preferred research areas:\n')
         print("\n\nThank you! I will remember that!")
         user_goals = input("\nAnd one more thing. What are the aims and goals of your current research?\n")
         print("\n\nThank you! Now let's research something wonderful together!")
@@ -189,7 +214,21 @@ def initialize_user(vdb, init_json_path="nexus/user-init.json", role='system'):
     return vector, user_metadata
 
 
-def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api=True) -> (dict, dict):
+def initialize_article(vdb: pinecone.Index, article_id: str, article_folder=ARTICLE_DIR, use_chat_api=True,
+                       generate_summary=False) -> (dict, dict):
+    """ Load existing article or initialize a new article based on article_id from arXiv.org.
+    If initializing new, the article is divided into sections, summarized one by one by GPT and then saved into
+    metadata['section_summaries'] with unique vector_ids. Sections are then vectorized and upserted to pinecone vdb
+    with the same vector_ids for fetching. pinecone vectors also have metadata with piconized(article_id) for
+    fetching article texts from local metadata.json file when semantic similarity searching.
+
+    :param vdb: (pinecone.Index) pinecone vector database index object
+    :param article_id: (str) arXiv id of an article
+    :param article_folder: (str) local folder where articles are stored (flags.ARTICLE_DIR)
+    :param use_chat_api: (bool) if true, openai.ChatCompletion.create is used, else Completion.create is used
+    :param generate_summary: (bool: False) if true, abstract is created by using GPT3/ if false, original abstract is used
+    :return: (dict, dict) metadata dictionary from local files and vectors dictionary fetched from pinecone
+    """
     path_to_metadata = article_folder.joinpath(f"{article_id}/metadata.json")
     if path_to_metadata.exists():
         metadata = json.load(path_to_metadata.open("r"))
@@ -214,10 +253,21 @@ def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api
                 # use text completion api (davinci)
                 summary = gpt3_completion(prompt).strip()
             vector_id = uuid4().hex
-            vector_list.append((vector_id, gpt3_embedding(summary), {"article": pineconize(article_id),  # TODO: pinecone identifies this as DATETIME type uff
-                                                                 "title": section_title}))  # NOTE: title might be unnecessary, we already have it in metadata
+            # NOTE: pinecone identifies strings with . as DATETIME type ... uff, using pineconize fun
+            vector_list.append((vector_id, gpt3_embedding(summary), {"article": pineconize(article_id),
+                                                                     "title": section_title}))
             metadata['section_summaries'][vector_id] = (section_title, summary)
             # TODO: as we have multiple vectors for one article, query by filtering article_id or title in metadata
+
+        # article-wide summary (aka custom abstract)
+        if generate_summary:
+            section_summaries = "\n\n".join([f"{c[0]}\n{c[1]}" for c in article_metadata['section_summaries']])
+            user_bio = json.load(NEXUS_DIR.joinpath("user_init.json").open("r"))['bio']
+            message = open_file("prompt_article-wide_summary.txt").replace("<<BIO>>",
+                                                                           user_bio).replace("<<TEXT>>",
+                                                                                             section_summaries)
+            article_summary = gpt3_chat_completion([{"role": "user", "content": message}])[-1]  # only take the summary
+            metadata['summary'] = article_summary["content"]
 
         vdb.upsert(vector_list, namespace=NS.ARTICLES.value)
         json.dump(metadata, path_to_metadata.open("w"))
@@ -227,20 +277,21 @@ def initialize_article(vdb, article_id, article_folder=ARTICLE_DIR, use_chat_api
     return metadata, vectors
 
 
-def fetch_similar_sections(vdb, vector, namespace=NS.ARTICLES.value, top_k=10, score_cutoff=0.5, include_values=True,
-                           include_metadata=True):
-    """ Fetches maximum of 'top_k' number of article sections with similar semantic meaning.
+def fetch_similar(vdb: pinecone.Index, vector, namespace=NS.ARTICLES.value, top_k=50, score_cutoff=0.5,
+                  include_values=False, include_metadata=False, excluded_ids: set = tuple()) -> list:
+    """ Fetches maximum of 'top_k' number of article sections (or other vectors) with similar semantic meaning.
     If similarity score is < score_cutoff, then the respective article section is not included in results.
 
 
     :param vdb: (pinecone.Index) pinecone vector database index object
     :param vector: (list[float]) vector by which we search similar ones, list of float values
     :param namespace: (str: NS.ARTICLES.value) index namespace to search within
-    :param top_k: (int: 10)maximum number of results found
+    :param top_k: (int: 50)maximum number of results found
     :param score_cutoff: (float: 0.5) similarity score threshold, if score is lower than cutoff, respective match is discarded
-    :param include_values: (bool: True), whether match should include vector values
-    :param include_metadata: (bool: True), whether match should include metadata
-    :return: (list[dict]) matches with similarity score above the cutoff in a list of dictionaries
+    :param include_values: (bool: False), whether match should include vector values
+    :param include_metadata: (bool: False), whether match should include metadata
+    :param excluded_ids: (set: {}) vector ids that should not be fetched
+    :return: (list[dict]) matches without excluded_ids and with similarity score above the cutoff in a list of dictionaries
      example output: [
         {
           "id": str,
@@ -263,7 +314,7 @@ def fetch_similar_sections(vdb, vector, namespace=NS.ARTICLES.value, top_k=10, s
     filtered_matches = []
     for match in response['matches']:
         score = match['score']
-        if score >= score_cutoff:
+        if match['id'] not in excluded_ids and score >= score_cutoff:
             filtered_matches.append(match)
 
     return filtered_matches
@@ -292,39 +343,96 @@ def new_conversation(user_bio: str, nexus_folder=NEXUS_DIR):
 
     conversation = [{"role": "system", "content": user_bio}]
 
-    with nexus_folder.joinpath(f"{conv_id}.json").open("w") as f:
-        json.dump(conversation, f, ensure_ascii=True, indent=4)
+    with jsonlines.open(nexus_folder.joinpath(f"{conv_id}.jsonl"), mode="w") as writer:
+        writer.write_all(conversation)
 
-    return conv_id, conversation
+    return conv_id, conversation, timestring
 
 
-def conversation_turn(speaker: str, message: str, payload: list[tuple[str, float]],
-                      n_top_convos=N_TOP_CONVOS, n_top_articles=N_TOP_ARTICLES):
-    timestamp = time()
-    timestring = timestamp_to_datetime(timestamp)
+def _summarize_conversation(conversation: list[dict[str, str]]) -> list[dict[str, str]]:
+    """
+    Summarizes a conversation if it exceeds the maximum number of words allowed.
+    The first ("system") message is left unchanged as well as the last ("user") message.
 
-    unique_id = uuid4().hex
-    metadata = {'speaker': speaker, 'time': timestamp, 'message': message, 'timestring': timestring, 'uuid': unique_id}
-    save_json('nexus/%s.json' % unique_id, metadata)
-    vector = gpt3_embedding(message)
-    payload.append((unique_id, vector))
+    :param conversation: list[dict[str, str]], the full conversation to be summarized
+    :return: list[dict[str, str]], the updated conversation (either the original or the summarized version)
+    """
+    total_length = sum(len(c['content']) for c in conversation)
+    if total_length < N_MAX_WORDS_IN_CONV:
+        return conversation
 
+    LOGGER.info(f"conversation is too long (n_words: {total_length})... Summarizing.")
+    fc_str = {"role": "system", "content": open_file('prompt_conv_compression.txt').replace(
+        '<<FULL_CONVERSATION>>', conversation2string(conversation[1:-1]))}
+    conv_summary = gpt3_chat_completion([fc_str])[-1:]
+    conversation_summary = conversation[:1] + conv_summary + conversation[-1:]  # adding first and last message
+    return conversation_summary
+
+
+def conversation_turn(speaker: str, conversation: list[dict[str, str]], conv_id: str, vdb: pinecone.Index,
+                      n_top_convos=N_TOP_CONVOS, n_top_sections=N_TOP_SECTIONS,
+                      nexus_folder=NEXUS_DIR, excluded_conv_ids: set = tuple(), excluded_vids: set = tuple()):
+    """
+    Generates a response based on the current conversation and metadata about previous conversations and articles.
+
+    :param speaker: str, the current speaker
+    :param conversation: list[dict[str, str]], the current conversation
+    :param conv_id: str, the conversation ID
+    :param n_top_convos: int, the number of top conversations to fetch from the database
+    :param vdb: pinecone.Index, object connection to the pinecone vector database index
+    :param n_top_sections: int, the number of top sections to fetch from the database
+    :param nexus_folder: str, the folder where the conversation is saved
+    :param excluded_conv_ids: set, vector ids of saved conversations which should be excluded from fetching (most likely already fetched in previous turns)
+    :param excluded_vids: set, vector ids of article sections which should be excluded from fetching (most likely already fetched in previous turns)
+    :return: list[dict[str, str]], the updated conversation
+    """
+
+    excluded_conv_ids = set(excluded_conv_ids)
+    excluded_vids = set(excluded_vids)
     if "SciHelper" in speaker:
         output = None
     else:
-        # search for relevant messages, and generate a response
-        prev_convos = vdb.query(vector=vector, top_k=n_top_convos, namespace=NS.CONVOS.value)
-        prev_articles = vdb.query(vector=vector, top_k=n_top_articles, namespace=NS.ARTICLES.value)
-        conversation = load_conversation(
-            prev_convos)  # results should be a DICT with 'matches' which is a LIST of DICTS, with 'id'
-        article_ids = load_articles(
-            prev_articles)  # TODO: now what do we actually do with these?, we should cache the article texts I guess
-        prompt = open_file('prompt_response.txt').replace('<<CONVERSATION>>', conversation).replace('<<MESSAGE>>',
-                                                                                                    message)
-        # generate response, vectorize, save, etc
-        output = gpt3_completion(prompt)
 
-    return output, vector, metadata
+        vector = gpt3_embedding(conversation2string(conversation[1:]))
+
+        # Search for relevant messages and generate a response
+        prev_convo_ids = [match['id'] for match in fetch_similar(vdb, vector, NS.CONVOS.value, top_k=n_top_convos,
+                                                                 excluded_ids=excluded_conv_ids)]
+        prev_conversation = load_conversation(prev_convo_ids)  # list[dict["role": str, "content": str], dict...]
+        excluded_conv_ids.update(prev_convo_ids)  # update already used conversations
+
+        # Fetch and add relevant article sections to the conversation
+        prev_unfetched_sections = [(match['id'], match['metadata']['article_id']) for match in
+                                   fetch_similar(vdb, vector, NS.ARTICLES.value, top_k=n_top_sections,
+                                                 excluded_ids=excluded_vids)]
+        section_dict = defaultdict(list)
+        for vid, aid in prev_unfetched_sections:
+            section_dict[aid].append(vid)
+            excluded_vids.add(vid)
+        sections = []
+        for aid, vid_list in section_dict.items():
+            sections.extend(fetch_article_sections(aid, vid_list))  # list[(title, summary), ...]
+        section_conversation = [{"role": "assistant", "content": "\n".join(s)} for s in sections]
+
+        # Combine all previous messages, relevant article sections, and current message
+        conversation = prev_conversation + section_conversation + conversation
+
+        # If conversation is too long, summarize it
+        conversation = _summarize_conversation(conversation)
+
+        # Generate response, vectorize, save, etc
+        conversation = gpt3_chat_completion(conversation)
+        # TODO: save as json with info about convos and article sections used for this convo
+        #   prev_convo_ids, vid_set
+        # TODO: embed and upsert to vdb
+
+        # conversation.append(full_conversation[-1])
+
+    # Update conversation jsonl file
+    with jsonlines.open(nexus_folder.joinpath(f"{conv_id}.jsonl"), mode="a") as writer:
+        writer.write(conversation[-1])
+
+    return conversation, excluded_conv_ids, excluded_vids
 
 
 def prompt_for_article():
@@ -351,36 +459,66 @@ if __name__ == '__main__':
     user_bio_summary = user_metadata["bio"]
     print(user_metadata["bio"])
 
-    # new conversation
-    conv_id, conversation = new_conversation(user_bio_summary)
-    # NOTE: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
-    #   when we have web-ui, we can use a button for this
-
-    # initialize article
-    article_id = prompt_for_article()
-    article_metadata, article_vectors = initialize_article(vdb, article_id)
-    # NOTE: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
-    #   when we have web-ui, we can use a button for this
-
-    print(article_metadata)
-
-    # fetch all vectors for given article
-    print(list(depineconize(v['metadata']['article']) for v in article_vectors['vectors'].values()))
-    exit()
     # v3_out['vectors'][id]['values']  # vector values
     # v3_out['vectors'][id]['metadata']  # vector metadata
 
-    # TODO: utilize summarized article in further user queries
+    # WIP: utilize summarized article in further user queries
     #   - NOTE: maybe summarize the summaries one more time for ultimate summary that saves us api tokens
 
+    exit_flag = False
+    reset_convo_flag = True
+    reset_article_flag = True
+    conversation, conv_id, conv_timestring = None, None, None
+    excluded_conv_ids = set()
+    excluded_sect_ids = set()
     while True:
-        #### get user input, save it, vectorize it, save to pinecone
-        payload = list()
-        # USER turn
-        message = input('\n\nUSER: ')
-        output, _, _ = conversation_turn("USER", message, payload)
+        if exit_flag:
+            LOGGER.info("Exiting program at user request.")
+            break
+        # new conversation
+        if reset_convo_flag:
+            # save previous conversation
+            if conversation is not None:  # TODO: make_async
+                print(f"Summarizing and saving previous conversation with id: {conv_id}.")
+                conv_summary = _summarize_conversation(conversation)[1:]  # summarize all except the user bio
+                summary_vector = gpt3_embedding(conversation2string(conv_summary))  # generate embedding
+                # send to pinecone
+                vdb.upsert([(conv_id, summary_vector, {"timestamp": conv_timestring})], namespace=NS.CONVOS.value)
 
-        # SciHelper turn
-        _, _, _ = conversation_turn("SciHelper", output, payload)
-        vdb.upsert(payload, namespace=NS.CONVOS.value)
-        print('\n\nSciHelper: %s' % output)
+            # generate new conversation
+            conv_id, conversation, conv_timestring = new_conversation(user_bio_summary)
+            excluded_conv_ids = set()
+            excluded_sect_ids = set()
+            reset_convo_flag = False
+            print(f"New conversation id: {conv_id}")
+            continue
+            # NOTE: this should be repeatable in a different thread or with async so we can have multiple convos at once
+            #   when we have web-ui, we can use a button for this
+        # new article
+        if reset_article_flag:
+            # initialize article
+            article_id = prompt_for_article()
+            article_metadata, article_vectors = initialize_article(vdb, article_id, generate_summary=GENERATE_SUMMARY)
+            print(f"New article id: {article_id}")
+            # article_metadata['section_summaries'].keys() == vector_ids
+            # article_metadata['section_summaries'].values() == (title, content)
+            article_summary = {"role": "user", "content": f"This is the abstract of the article, we are going to discuss:\n{article_metadata['summary']}"}
+            conversation.append(article_summary)
+            # TODO: what about with respect to previous conversation turns as well?
+            reset_article_flag = False
+            continue
+            # NOTE: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
+            #   when we have web-ui, we can use a button for this
+
+        # get user input
+        message = input('\n\nUSER: ')
+        conversation.append({"role": "user", "content": message.strip()})
+
+        # HANLDERS:
+        exit_flag = handle_flag(conversation, "exit program")
+        reset_convo_flag = handle_flag(conversation, "reset conversation")
+        reset_article_flag = handle_flag(conversation, "reset article")
+
+        conversation, excluded_conv_ids, excluded_sect_ids = conversation_turn("USER", conversation, conv_id, vdb,
+                                                                               excluded_conv_ids=excluded_conv_ids,
+                                                                               excluded_vids=excluded_sect_ids)

@@ -1,0 +1,5 @@
+Summarize and compress this academic discussion into a 300-word document using database system and bullet points to focus on most critical aspects of the discussion, including the main topic, goals, research questions, methods, results, and conclusions rather than repeating the exact words spoken during the conversation. Be factual, don't repeat yourself and don't make up any new conclusions which are not present in the discussion.
+---
+<<FULL_CONVERSATION>>
+---
+BEGIN:

@@ -16,6 +16,14 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.WARNING)
 
 
+def handle_flag(conversation: list[dict[str:str, str:str]], expected_value: str) -> bool:
+    message = conversation[-1]["content"]
+    if expected_value in message:
+        return True
+    else:
+        return False
+
+
 def cleanup_prompt(prompt: str):
     return prompt.encode(encoding='ASCII', errors='ignore').decode().strip()
 
