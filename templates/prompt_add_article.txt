@@ -1,0 +1,5 @@
+The following is a title and an abstract of one article we are going to discuss:
+title: '<<TITLE>>'
+
+abstract:
+<<ABSTRACT>>

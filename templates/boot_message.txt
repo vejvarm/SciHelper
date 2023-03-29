@@ -1,0 +1,5 @@
+Welcome to SciHelper. This is an alpha version that runs on text commands only and as such you can use the following inputs to control the system:
+
+'exit program' ... terminates the main loop and exits the program
+'reset conversation' ... terminates the current conversation and initializes a new conversation
+'add article' ... initializes new article and adds its summary to current conversation

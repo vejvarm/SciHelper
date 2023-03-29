@@ -14,10 +14,10 @@ import logging
 import os
 from collections import defaultdict
 
+import numpy as np
 import openai
 import json
 import jsonlines
-import re
 from datetime import datetime
 import pinecone
 from pathlib import Path
@@ -25,36 +25,13 @@ from time import time, sleep
 from uuid import uuid4
 from utils import handle_flag, cleanup_prompt, extract_text_from_completion_api_response, \
     extract_text_from_chat_api_response, fetch_and_download_from_arxiv, extract_arxiv_id, choose_source_file_parser, \
-    pineconize, depineconize
-from flags import NS, N_TOP_SECTIONS, N_TOP_CONVOS, ARTICLE_DIR, LOG_DIR, NEXUS_DIR, TIME_FORMAT, N_MAX_WORDS_IN_CONV, \
-    DEFAULT_EMBEDDING_ENGINE, GENERATE_SUMMARY
+    pineconize, depineconize, open_file, save_file, save_json, timestamp_to_datetime, num_tokens_in_convo, split_text_to_n_token_chunks
+from flags import NS, N_TOP_SECTIONS, N_TOP_CONVOS, ARTICLE_DIR, TEMPLATES_DIR, LOG_DIR, NEXUS_DIR, TIME_FORMAT, \
+    N_MAX_WORDS_IN_CONV, \
+    DEFAULT_EMBEDDING_ENGINE, DEFAULT_MODEL, GENERATE_SUMMARY, Commands, CONVO_SCORE_CUTOFF, SECTION_SCORE_CUTOFF
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
-
-
-def open_file(filepath):
-    with open(filepath, 'r', encoding='utf-8') as infile:
-        return infile.read()
-
-
-def save_file(filepath, content):
-    with open(filepath, 'w', encoding='utf-8') as outfile:
-        outfile.write(content)
-
-
-def load_json(filepath):
-    with open(filepath, 'r', encoding='utf-8') as infile:
-        return json.load(infile)
-
-
-def save_json(filepath, payload):
-    with open(filepath, 'w', encoding='utf-8') as outfile:
-        json.dump(payload, outfile, ensure_ascii=False, sort_keys=True, indent=2)
-
-
-def timestamp_to_datetime(unix_time):
-    return datetime.fromtimestamp(unix_time).strftime("%A, %B %d, %Y at %I:%M%p %Z")
 
 
 def gpt3_embedding(content: str, engine=DEFAULT_EMBEDDING_ENGINE):
@@ -98,8 +75,8 @@ def gpt3_completion(prompt, engine='text-davinci-003', temp=0.0, top_p=1.0, toke
             sleep(1)
 
 
-def gpt3_chat_completion(conversation: list[dict[str: str]], model="gpt-3.5-turbo", log_folder=LOG_DIR) -> list[dict]:
-    """ provide completion output from chat-gpt api given a list of messages (dicts) in the current conversation
+def gpt3_chat_completion(conversation: list[dict[str: str]], model=DEFAULT_MODEL, log_folder=LOG_DIR) -> list[dict]:
+    """ Provide completion output from chat-gpt api given a list of messages (dicts) in the current conversation.
 
     :param conversation: list of conversation turns (dicts).
         keys are "role" (:"system", "assistant" or "user") and "content" (: message_string)
@@ -144,10 +121,10 @@ def gpt3_chat_completion(conversation: list[dict[str: str]], model="gpt-3.5-turb
             sleep(1)
 
 
-def load_conversation(matches: list[dict[str: str]], nexus_folder=NEXUS_DIR) -> list:
+def load_conversation(matches: list[str], nexus_folder=NEXUS_DIR) -> list[dict[str: str]]:
     """
 
-    :param matches: results from vdb query  for convos (should be list of dicts with key "id")
+    :param matches: results from vdb query  for convos (list of strings which are ids of the convos)
     :param nexus_folder: folder in which conversations are stored
     :return: list[dict["role": str, "content": str]] ... joined list of conversations
              [] if no matches found
@@ -155,8 +132,9 @@ def load_conversation(matches: list[dict[str: str]], nexus_folder=NEXUS_DIR) -> 
     nexus_folder = Path(nexus_folder)
     convo_list = list()
     for m in matches:
+        print(m)
         try:
-            with jsonlines.Reader(nexus_folder.joinpath(f"{m['id']}.jsonl").open("r")) as reader:
+            with jsonlines.Reader(nexus_folder.joinpath(f"{m}.jsonl").open("r")) as reader:
                 info = reader.iter()
                 convo_list.extend(info)
         except FileNotFoundError as err:
@@ -188,13 +166,13 @@ def initialize_user(vdb, init_json_path="nexus/user-init.json", role='system'):
         vector = vdb.fetch([id], namespace=NS.USER_INIT.value)
         # TODO: add user-bio reset option
     else:
-        print('\nWelcome, my name is SciHelper. I am here to help you with your research. And you are?\n')
+        print('\nWelcome! My name is SciHelper. I am here to help you with your research. And you are?\n')
         user_bio = input(
             'Please introduce yourself and your research background as well as preferred research areas:\n')
         print("\n\nThank you! I will remember that!")
         user_goals = input("\nAnd one more thing. What are the aims and goals of your current research?\n")
         print("\n\nThank you! Now let's research something wonderful together!")
-        message = open_file('prompt_init.txt').replace('<<USER_BIO>>', user_bio).replace('<<USER_GOALS>>', user_goals)
+        message = open_file(TEMPLATES_DIR.joinpath('prompt_init.txt')).replace('<<USER_BIO>>', user_bio).replace('<<USER_GOALS>>', user_goals)
 
         conversation = gpt3_chat_completion([{"role": role, "content": message}])
         summary = conversation[-1]["content"]
@@ -242,29 +220,36 @@ def initialize_article(vdb: pinecone.Index, article_id: str, article_folder=ARTI
         # summarize article sections and save the vector representations into Pinecone
         for section_title, section_content in sections.items():
             # compress article sections into concise summaries
-            prompt = open_file('prompt_summarize.txt').replace('<<TEXT>>', f"{section_title}\n{section_content}")
-            if use_chat_api:
-                # use chat completion api (chatgpt)
-                # TODO:0 !!! if section_content longer than some maximum, split it into two and recursively run with summary of the previous sections attached
-                conversation = [{"role": "system", "content": cleanup_prompt(prompt)}, ]
-                LOGGER.debug(conversation)
-                summary = gpt3_chat_completion(conversation)[-1]["content"]
-            else:
-                # use text completion api (davinci)
-                summary = gpt3_completion(prompt).strip()
+            section_chunks = split_text_to_n_token_chunks(f"{section_title}\n{section_content}")
+            # TODO: can be made much better. e.g. split by periods and then approximately split at the closest sentence end.
+            summary = None
+            for chunk in section_chunks:
+                if summary:
+                    chunk = f"{summary}\n\n{chunk}"  # feedback loop to include summaries of previous chunks as well.
+                prompt = open_file(TEMPLATES_DIR.joinpath('prompt_summarize.txt')).replace('<<TEXT>>', chunk)
+                if use_chat_api:
+                    # use chat completion api (chatgpt)
+                    # TODO:0 !!! if section_content longer than some maximum, split it into two and recursively run with summary of the previous sections attached
+                    conversation = [{"role": "system", "content": cleanup_prompt(prompt)}, ]
+                    LOGGER.debug(conversation)
+                    summary = gpt3_chat_completion(conversation)[-1]["content"]
+                else:
+                    # use text completion api (davinci)
+                    summary = gpt3_completion(prompt).strip()
             vector_id = uuid4().hex
             # NOTE: pinecone identifies strings with . as DATETIME type ... uff, using pineconize fun
             vector_list.append((vector_id, gpt3_embedding(summary), {"article": pineconize(article_id),
                                                                      "title": section_title}))
             metadata['section_summaries'][vector_id] = (section_title, summary)
+            LOGGER.info(f"------\n{metadata['section_summaries'][vector_id][0]}\n{metadata['section_summaries'][vector_id][1]}\n------\n\n")
             # TODO: as we have multiple vectors for one article, query by filtering article_id or title in metadata
 
         # article-wide summary (aka custom abstract)
         if generate_summary:
-            section_summaries = "\n\n".join([f"{c[0]}\n{c[1]}" for c in article_metadata['section_summaries']])
-            user_bio = json.load(NEXUS_DIR.joinpath("user_init.json").open("r"))['bio']
-            message = open_file("prompt_article-wide_summary.txt").replace("<<BIO>>",
-                                                                           user_bio).replace("<<TEXT>>",
+            section_summaries = "\n\n".join([f"{c[0]}\n{c[1]}" for c in metadata['section_summaries']])
+            user_bio = json.load(NEXUS_DIR.joinpath("user-init.json").open("r"))['bio']
+            message = open_file(TEMPLATES_DIR.joinpath('prompt_article-wide_summary.txt')).replace("<<BIO>>",
+                                                                                        user_bio).replace("<<TEXT>>",
                                                                                              section_summaries)
             article_summary = gpt3_chat_completion([{"role": "user", "content": message}])[-1]  # only take the summary
             metadata['summary'] = article_summary["content"]
@@ -316,6 +301,7 @@ def fetch_similar(vdb: pinecone.Index, vector, namespace=NS.ARTICLES.value, top_
         score = match['score']
         if match['id'] not in excluded_ids and score >= score_cutoff:
             filtered_matches.append(match)
+    print(filtered_matches)
 
     return filtered_matches
 
@@ -357,12 +343,14 @@ def _summarize_conversation(conversation: list[dict[str, str]]) -> list[dict[str
     :param conversation: list[dict[str, str]], the full conversation to be summarized
     :return: list[dict[str, str]], the updated conversation (either the original or the summarized version)
     """
-    total_length = sum(len(c['content']) for c in conversation)
+    total_length = num_tokens_in_convo(conversation, DEFAULT_MODEL)
+    LOGGER.info(f"conversation length: {total_length}")
     if total_length < N_MAX_WORDS_IN_CONV:
         return conversation
 
-    LOGGER.info(f"conversation is too long (n_words: {total_length})... Summarizing.")
-    fc_str = {"role": "system", "content": open_file('prompt_conv_compression.txt').replace(
+    LOGGER.info(f"conversation is too long (n_tokens: {total_length})... Summarizing.")
+    LOGGER.info(f"conversation (before summary): {conversation}")
+    fc_str = {"role": "system", "content": open_file(TEMPLATES_DIR.joinpath('prompt_conv_compression.txt')).replace(
         '<<FULL_CONVERSATION>>', conversation2string(conversation[1:-1]))}
     conv_summary = gpt3_chat_completion([fc_str])[-1:]
     conversation_summary = conversation[:1] + conv_summary + conversation[-1:]  # adding first and last message
@@ -397,13 +385,16 @@ def conversation_turn(speaker: str, conversation: list[dict[str, str]], conv_id:
 
         # Search for relevant messages and generate a response
         prev_convo_ids = [match['id'] for match in fetch_similar(vdb, vector, NS.CONVOS.value, top_k=n_top_convos,
+                                                                 score_cutoff=CONVO_SCORE_CUTOFF,
                                                                  excluded_ids=excluded_conv_ids)]
         prev_conversation = load_conversation(prev_convo_ids)  # list[dict["role": str, "content": str], dict...]
         excluded_conv_ids.update(prev_convo_ids)  # update already used conversations
 
         # Fetch and add relevant article sections to the conversation
-        prev_unfetched_sections = [(match['id'], match['metadata']['article_id']) for match in
+        # TODO: alternatively fetch only based on the latest user input?
+        prev_unfetched_sections = [(match['id'], match['metadata']['article']) for match in
                                    fetch_similar(vdb, vector, NS.ARTICLES.value, top_k=n_top_sections,
+                                                 score_cutoff=SECTION_SCORE_CUTOFF, include_metadata=True,
                                                  excluded_ids=excluded_vids)]
         section_dict = defaultdict(list)
         for vid, aid in prev_unfetched_sections:
@@ -415,7 +406,7 @@ def conversation_turn(speaker: str, conversation: list[dict[str, str]], conv_id:
         section_conversation = [{"role": "assistant", "content": "\n".join(s)} for s in sections]
 
         # Combine all previous messages, relevant article sections, and current message
-        conversation = prev_conversation + section_conversation + conversation
+        conversation = conversation[:1] + prev_conversation + section_conversation + conversation[1:]
 
         # If conversation is too long, summarize it
         conversation = _summarize_conversation(conversation)
@@ -430,7 +421,7 @@ def conversation_turn(speaker: str, conversation: list[dict[str, str]], conv_id:
 
     # Update conversation jsonl file
     with jsonlines.open(nexus_folder.joinpath(f"{conv_id}.jsonl"), mode="a") as writer:
-        writer.write(conversation[-1])
+        writer.write_all(conversation[-2:])
 
     return conversation, excluded_conv_ids, excluded_vids
 
@@ -454,10 +445,13 @@ if __name__ == '__main__':
     pinecone.init(api_key=open_file('key_pinecone.txt'), environment='us-east-1-aws')
     vdb = pinecone.Index("llm-ltm")
 
+    # Boot message
+    print(open_file(TEMPLATES_DIR.joinpath("boot_message.txt")))
+
     # ask for user bio and preferences, if they don't exist already
     user_vector, user_metadata = initialize_user(vdb)
     user_bio_summary = user_metadata["bio"]
-    print(user_metadata["bio"])
+    LOGGER.info(f"user bio saved as: {user_bio_summary}")
 
     # v3_out['vectors'][id]['values']  # vector values
     # v3_out['vectors'][id]['metadata']  # vector metadata
@@ -467,20 +461,27 @@ if __name__ == '__main__':
 
     exit_flag = False
     reset_convo_flag = True
-    reset_article_flag = True
+    new_article_flag = True
     conversation, conv_id, conv_timestring = None, None, None
     excluded_conv_ids = set()
     excluded_sect_ids = set()
     while True:
         if exit_flag:
+            # TODO: make into function
             LOGGER.info("Exiting program at user request.")
+            if conversation is not None:  # TODO: make_async
+                print(f"Summarizing and saving previous conversation with id: {conv_id}.")
+                conv_summary = _summarize_conversation(conversation)[1:]  # summarize and exclude the user bio
+                summary_vector = gpt3_embedding(conversation2string(conv_summary))  # generate embedding
+                # send to pinecone
+                vdb.upsert([(conv_id, summary_vector, {"timestamp": conv_timestring})], namespace=NS.CONVOS.value)
             break
         # new conversation
         if reset_convo_flag:
             # save previous conversation
             if conversation is not None:  # TODO: make_async
                 print(f"Summarizing and saving previous conversation with id: {conv_id}.")
-                conv_summary = _summarize_conversation(conversation)[1:]  # summarize all except the user bio
+                conv_summary = _summarize_conversation(conversation)[1:]  # summarize and exclude the user bio
                 summary_vector = gpt3_embedding(conversation2string(conv_summary))  # generate embedding
                 # send to pinecone
                 vdb.upsert([(conv_id, summary_vector, {"timestamp": conv_timestring})], namespace=NS.CONVOS.value)
@@ -494,18 +495,21 @@ if __name__ == '__main__':
             continue
             # NOTE: this should be repeatable in a different thread or with async so we can have multiple convos at once
             #   when we have web-ui, we can use a button for this
-        # new article
-        if reset_article_flag:
+        # add new article to the coversation
+        if new_article_flag:
             # initialize article
             article_id = prompt_for_article()
             article_metadata, article_vectors = initialize_article(vdb, article_id, generate_summary=GENERATE_SUMMARY)
-            print(f"New article id: {article_id}")
+            print(f"Adding new article with id: {article_id}")
             # article_metadata['section_summaries'].keys() == vector_ids
             # article_metadata['section_summaries'].values() == (title, content)
-            article_summary = {"role": "user", "content": f"This is the abstract of the article, we are going to discuss:\n{article_metadata['summary']}"}
+            article_summary = {"role": "user", "content": open_file(TEMPLATES_DIR.joinpath("prompt_add_article.txt")
+                                                                    ).replace("<<TITLE>>", article_metadata['title']
+                                                                              ).replace("<<ABSTRACT>>",
+                                                                                        article_metadata['summary'])}
             conversation.append(article_summary)
             # TODO: what about with respect to previous conversation turns as well?
-            reset_article_flag = False
+            new_article_flag = False
             continue
             # NOTE: this should be repeatable (maybe different thread and invoke at specific USER prompt?)
             #   when we have web-ui, we can use a button for this
@@ -515,10 +519,12 @@ if __name__ == '__main__':
         conversation.append({"role": "user", "content": message.strip()})
 
         # HANLDERS:
-        exit_flag = handle_flag(conversation, "exit program")
-        reset_convo_flag = handle_flag(conversation, "reset conversation")
-        reset_article_flag = handle_flag(conversation, "reset article")
+        exit_flag = handle_flag(conversation, Commands.EXIT)
+        reset_convo_flag = handle_flag(conversation, Commands.RESET_CONVO)
+        new_article_flag = handle_flag(conversation, Commands.ADD_ARTICLE)
 
         conversation, excluded_conv_ids, excluded_sect_ids = conversation_turn("USER", conversation, conv_id, vdb,
                                                                                excluded_conv_ids=excluded_conv_ids,
                                                                                excluded_vids=excluded_sect_ids)
+
+        print(conversation[-1]["content"])

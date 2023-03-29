@@ -2,23 +2,27 @@ import json
 import logging
 import re
 import os
-import tarfile
 import requests
+import tarfile
+from datetime import datetime
+
 import arxiv
+import numpy as np
 import PyPDF2
+import tiktoken
 from pylatexenc.latexwalker import LatexWalker, LatexEnvironmentNode, LatexMacroNode, LatexWalkerError, LatexGroupNode
 from pylatexenc.latex2text import LatexNodes2Text
 from pathlib import Path
-from flags import ROOT_DIR, ARTICLE_DIR
 from typing import Sequence, Union, Callable
+from flags import Commands, N_MAX_TOKENS_IN_ARTICLE_SECTION
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.WARNING)
 
 
-def handle_flag(conversation: list[dict[str:str, str:str]], expected_value: str) -> bool:
+def handle_flag(conversation: list[dict[str:str, str:str]], expected_value: Commands) -> bool:
     message = conversation[-1]["content"]
-    if expected_value in message:
+    if expected_value.value in message:
         return True
     else:
         return False
@@ -129,7 +133,7 @@ def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sou
                                      title=paper.title,
                                      authors=[a.name for a in paper.authors],
                                      categories=paper.categories,
-                                     published=paper.published.strftime("%Y-%M-%d"),
+                                     published=paper.published.strftime("%Y-%m-%d"),
                                      journal_ref=paper.journal_ref,
                                      links=[l.href for l in paper.links],
                                      url=paper.pdf_url,
@@ -168,10 +172,10 @@ def fetch_and_download_from_arxiv(article: str, article_folder: Path or str, sou
         return None, metadata
 
 
-def _resolve_auxilary_tex_files(source_text: str, source_folder: Path) -> str:
+def _resolve_input_statements_in_tex_file(source_text: str, source_folder: Path) -> str:
     """ Search through given text and find all instances of '\input{NAME}'.
-    For each instance of '\input{NAME}' found, look for file called 'NAME.tex' and replace the '\input{NAME}' entry
-    with the contents of the 'NAME.tex' file.
+    For each instance of '\input{NAME}' found, look for file called 'NAME.tex'/'NAME.tikz' and replace the
+    '\input{NAME}' entry with the contents of the 'NAME.tex/.tikz' file.
     :param source_text: raw text string from the 'main.tex' file
     :param source_folder: Path to the source folder of the main.tex file
     :return parsed_text: source_text with all found instances of '\input{NAME}' replaced with the contents of their respective NAME.tex files
@@ -179,20 +183,23 @@ def _resolve_auxilary_tex_files(source_text: str, source_folder: Path) -> str:
     pattern = r"\\input\{(.+?)(?:\.tex)?\}"  # TODO: reduce the . to only allowed characters in filename strings
     matches = re.findall(pattern, source_text)
     for match in matches:
-        tex_file = match + '.tex'
+        if match.endswith(".tikz"):
+            file_name = match
+        else:
+            file_name = match + '.tex'
         matched_pattern = '\\input{' + match + '}'
         try:
-            with source_folder.joinpath(tex_file).open('r') as f:
+            with source_folder.joinpath(file_name).open('r') as f:
                 tex_contents = f.read()
         except FileNotFoundError as er:
             LOGGER.warning(f"{er}\nsearching recursively through subfolders")
 
             try:
-                file = next(source_folder.glob(f"**/{tex_file}"))
+                file = next(source_folder.glob(f"**/{file_name}"))
                 with file.open('r') as f:
                     tex_contents = f.read()
             except StopIteration:
-                LOGGER.warning(f'No file with name {tex_file} found, keeping the original {matched_pattern} clause')
+                LOGGER.warning(f'No file with name {file_name} found, keeping the original {matched_pattern} clause')
                 tex_contents = matched_pattern
 
         source_text = source_text.replace(matched_pattern, tex_contents)
@@ -204,7 +211,7 @@ def choose_source_file_parser(source_file: Union[Path, str]) -> Callable:
     """Validate if arXiv source file type is compatible with article parser and return appropriate parser function.
 
     The supported file types from arXiv are .tex and .pdf.
-    - if .tex, return split_parsed_latex_file()
+    - if .tex, return parse_and_split_latex_file()
     - if .pdf, return parse_pdf_file_and_split()
 
     :param source_file: path to arXiv source file (main.tex or {article_id}.pdf)
@@ -213,7 +220,7 @@ def choose_source_file_parser(source_file: Union[Path, str]) -> Callable:
     """
     source_file = Path(source_file)
     if source_file.suffix == ".tex":
-        return split_parsed_latex_file
+        return parse_and_split_latex_file
     elif source_file.suffix == ".pdf":
         return parse_pdf_file_and_split
     else:
@@ -235,7 +242,7 @@ def _parse_latex_file(source_tex_file: Path or str):
     text = _read_text_from_file(source_file)
 
     # parse auxilary .tex files which are referenced by /input{} in source_tex_file
-    text = _resolve_auxilary_tex_files(text, source_file.parent)
+    text = _resolve_input_statements_in_tex_file(text, source_file.parent)
     LOGGER.debug(text)
 
     walker = LatexWalker(text)
@@ -255,7 +262,7 @@ def _parse_latex_file(source_tex_file: Path or str):
     return sections, doc_nodelist
 
 
-def split_parsed_latex_file(source_tex_file: Path or str) -> dict[str: str]:
+def parse_and_split_latex_file(source_tex_file: Path or str) -> dict[str: str]:
     """ Function that parses a provided latex document file and splits it by \section{...} nodes of the document
     :param tex: path to main LaTeX file of the article. Usually should be called main.tex
     :return sections (dict[section name: section content]): section names and contents parsed in plain text (unicode)
@@ -272,7 +279,7 @@ def split_parsed_latex_file(source_tex_file: Path or str) -> dict[str: str]:
     sections, doc_nodelist = _parse_latex_file(source_tex_file)
 
     for node in doc_nodelist:
-        LOGGER.debug(f"node@for node in doc_nodelist: {node}")
+        # LOGGER.warning(f"node@for node in doc_nodelist: {node}")
         if node.isNodeType(LatexMacroNode) and node.macroname == 'section':
             LOGGER.debug(f"node@if node.isNodeType(LatexMacroNode) and node.macroname == 'section': {node}")
             if current_section is not None:
@@ -284,6 +291,13 @@ def split_parsed_latex_file(source_tex_file: Path or str) -> dict[str: str]:
                 if n.isNodeType(LatexGroupNode):
                     LOGGER.debug(f"n@for n in node.nodeargd.argnlist: {n}")
                     current_section = n.nodelist[0].chars
+            current_content = []
+        elif node.isNodeType(LatexEnvironmentNode) and node.environmentname == 'section':
+            current_section = node.nodelist[0].nodelist[0].chars
+            for node in node.nodelist[1:]:
+                current_content.append(node)
+            if current_section is not None:
+                sections[current_section.strip()] = ''.join(latex2text.nodelist_to_text(current_content)).strip()
             current_content = []
         elif current_section is not None:
             current_content.append(node)
@@ -350,3 +364,82 @@ def parse_pdf_file_and_split(source_pdf_file: Path or str) -> dict[str: str]:
         section_content = section_text[:section_end].strip()
         sections[section_title.strip()] = section_content.strip()
     return sections
+
+
+def open_file(filepath):
+    with open(filepath, 'r', encoding='utf-8') as infile:
+        return infile.read()
+
+
+def save_file(filepath, content):
+    with open(filepath, 'w', encoding='utf-8') as outfile:
+        outfile.write(content)
+
+
+def load_json(filepath):
+    with open(filepath, 'r', encoding='utf-8') as infile:
+        return json.load(infile)
+
+
+def save_json(filepath, payload):
+    with open(filepath, 'w', encoding='utf-8') as outfile:
+        json.dump(payload, outfile, ensure_ascii=False, sort_keys=True, indent=2)
+
+
+def timestamp_to_datetime(unix_time):
+    return datetime.fromtimestamp(unix_time).strftime("%A, %B %d, %Y at %I:%M%p %Z")
+
+
+def num_tokens_in_convo(convo: list[dict[str:str, str:str]], model="gpt-3.5-turbo-0301"):
+    """Returns the number of tokens used by a list of conversations."""
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        LOGGER.warning("model not found. Using cl100k_base encoding.")
+        encoding = tiktoken.get_encoding("cl100k_base")
+    if model == "gpt-3.5-turbo":
+        LOGGER.warning("gpt-3.5-turbo may change over time. Returning num tokens assuming gpt-3.5-turbo-0301.")
+        return num_tokens_in_convo(convo, model="gpt-3.5-turbo-0301")
+    elif model == "gpt-4":
+        LOGGER.warning("gpt-4 may change over time. Returning num tokens assuming gpt-4-0314.")
+        return num_tokens_in_convo(convo, model="gpt-4-0314")
+    elif model == "gpt-3.5-turbo-0301":
+        tokens_per_message = 4  # every message follows <|start|>{role/name}\n{content}<|end|>\n
+        tokens_per_name = -1  # if there's a name, the role is omitted
+    elif model == "gpt-4-0314":
+        tokens_per_message = 3
+        tokens_per_name = 1
+    else:
+        raise NotImplementedError(f"""num_tokens_in_convo() is not implemented for model {model}. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how convo are converted to tokens.""")
+    num_tokens = 0
+    for message in convo:
+        num_tokens += tokens_per_message
+        for key, value in message.items():
+            num_tokens += len(encoding.encode(value))
+            if key == "name":
+                num_tokens += tokens_per_name
+    num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
+    return num_tokens
+
+
+def split_text_to_n_token_chunks(text: str, n_max_tokens: int = N_MAX_TOKENS_IN_ARTICLE_SECTION,
+                                 avg_n_chars_per_token: int = 4) -> list[str]:
+    """
+    Splits a given text into a list of chunks, where each chunk has similar length and the length of each chunk does not exceed the given maximum number of tokens.
+
+    :param text: The text to be split into chunks.
+    :param n_max_tokens: The maximum number of tokens allowed in each chunk. Defaults to the value of N_MAX_TOKENS_IN_ARTICLE_SECTION.
+    :param avg_n_chars_per_token: The average number of characters per token. Defaults to 4.
+    :return: A list of chunks, where each chunk has similar length and the length of each chunk does not exceed the given maximum number of tokens.
+    """
+    num_chars = len(text)
+    num_tokens = num_chars//avg_n_chars_per_token + 1
+    LOGGER.info(f"approximate number of tokens: {num_tokens}")
+    chunks = []
+    n_chunks = num_tokens//n_max_tokens + 1
+
+    split_positions = np.linspace(0, num_chars, n_chunks + 1, dtype=np.int64)
+    for i in range(n_chunks):
+        chunks.append(text[split_positions[i]:split_positions[i + 1]])
+
+    return chunks
