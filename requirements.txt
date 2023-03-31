@@ -1,0 +1,8 @@
+openai
+numpy
+jsonlines
+requests
+arxiv
+PyPDF2
+tiktoken
+pylatexenc

@@ -1,4 +1,4 @@
-from chat2 import load_conversation
+from main import load_conversation
 
 
 if __name__ == "__main__":

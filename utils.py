@@ -180,7 +180,7 @@ def _resolve_input_statements_in_tex_file(source_text: str, source_folder: Path)
     :param source_folder: Path to the source folder of the main.tex file
     :return parsed_text: source_text with all found instances of '\input{NAME}' replaced with the contents of their respective NAME.tex files
     """
-    pattern = r"\\input\{(.+?)(?:\.tex)?\}"  # TODO: reduce the . to only allowed characters in filename strings
+    pattern = r"\\input\{(.+?)(?:\.tex)?\}"
     matches = re.findall(pattern, source_text)
     for match in matches:
         if match.endswith(".tikz"):
@@ -254,7 +254,7 @@ def _parse_latex_file(source_tex_file: Path or str):
             doc_nodelist = node.nodelist
             break
     else:
-        raise LatexWalkerError("No document node found in provided tex file. Is it a full latex document?")  # TODO: catch
+        raise LatexWalkerError("No document node found in provided tex file. Is it a full latex document?")
 
     abstract_section = re.compile(r'\\begin\{abstract\}((.|\n)+)\\end\{abstract\}')
     sections = {'abstract': re.search(abstract_section, text).group(0)}
@@ -267,19 +267,16 @@ def parse_and_split_latex_file(source_tex_file: Path or str) -> dict[str: str]:
     :param tex: path to main LaTeX file of the article. Usually should be called main.tex
     :return sections (dict[section name: section content]): section names and contents parsed in plain text (unicode)
     """
-    # DONE (critical): add support for parsing `\input{1_intro}` files into `main.tex`
-    # TODO (normal): add support for citations (currently the parsed content has `<cit.>` everywhere)
-    # return doc_nodelist, sections,
-    # latex2text
-    latex2text = LatexNodes2Text(math_mode='text',  # unicode TODO: test if verbatim better
+
+    latex2text = LatexNodes2Text(math_mode='text',
                                  fill_text=False,
-                                 strict_latex_spaces=True)  # TODO: replace excessive /n characters
+                                 strict_latex_spaces=True)
     current_content = []
     current_section = None
     sections, doc_nodelist = _parse_latex_file(source_tex_file)
 
     for node in doc_nodelist:
-        # LOGGER.warning(f"node@for node in doc_nodelist: {node}")
+        LOGGER.debug(f"node@for node in doc_nodelist: {node}")
         if node.isNodeType(LatexMacroNode) and node.macroname == 'section':
             LOGGER.debug(f"node@if node.isNodeType(LatexMacroNode) and node.macroname == 'section': {node}")
             if current_section is not None:
@@ -344,7 +341,7 @@ def _parse_pdf(source_pdf_file: Path or str) -> (str, PyPDF2.DocumentInformation
 
 def parse_pdf_file_and_split(source_pdf_file: Path or str) -> dict[str: str]:
     """Split parsed pdf (plain text) into parts, which correspond to Sections of the article"""
-    # TODO: it doesn't do a good job --> REWRITE
+
     LOGGER.warning("Parsing from PDF is buggy and inefficient. "
                    "It will most likely have undesirable results.\n"
                    "Check if the provided article has available .tex source files on arXiv \n"

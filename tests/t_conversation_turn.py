@@ -1,7 +1,7 @@
 import openai
 import pinecone
 from utils import open_file
-from chat2 import conversation_turn
+from main import conversation_turn
 
 
 def test_conversation_turn(conversation, excluded_conv_ids: set, excluded_vids: set):
